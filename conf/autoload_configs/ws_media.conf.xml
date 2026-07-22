@@ -1,0 +1,29 @@
+<configuration name="ws_media.conf" description="WebSocket Media Bridge Module">
+  <settings>
+    <!-- WebSocket server configuration -->
+    <param name="ws-host" value="localhost"/>
+    <param name="ws-port" value="8080"/>
+    <param name="ws-path" value="/media"/>
+    <param name="ws-ssl" value="false"/>
+
+    <!-- Authentication (optional) -->
+    <!-- <param name="ws-auth-user" value="username"/> -->
+    <!-- <param name="ws-auth-pass" value="password"/> -->
+
+    <!-- Query parameters for WebSocket handshake (optional) -->
+    <!-- Example: session_id=123&api_key=abc -->
+    <!-- <param name="ws-query-params" value="session_id=123&api_key=abc"/> -->
+
+    <!-- Buffer and latency settings -->
+    <param name="max-queue-size" value="8192"/>
+    <param name="drop-threshold" value="4096"/>
+    <param name="reconnect-interval" value="5"/>
+
+    <!-- Retry configuration -->
+    <param name="max-retry-count" value="3"/>
+
+    <!-- Packet loss threshold (0.0-1.0, e.g., 0.3 = 30%) -->
+    <!-- If packet loss exceeds this threshold, bypass mode is enabled -->
+    <param name="packet-loss-threshold" value="0.3"/>
+  </settings>
+</configuration>

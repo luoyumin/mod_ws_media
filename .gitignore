@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.so
+*.lo
+*.la
+*.dylib
+*.dSYM/
+.libs/
+
+# In-tree autotools leftovers (when dropped into a FreeSWITCH source tree)
+Makefile.in
+.deps/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Python test server
+__pycache__/
+*.pyc
