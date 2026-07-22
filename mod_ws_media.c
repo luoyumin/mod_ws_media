@@ -68,6 +68,7 @@ typedef struct {
 	int ws_port;
 	char *ws_path;
 	int ws_ssl;
+	int ws_ssl_verify;         /* Verify server certificate when ws_ssl is on */
 	char *ws_auth_user;        /* Authentication username */
 	char *ws_auth_pass;        /* Authentication password */
 	char *ws_query_params;     /* Query parameters for WebSocket handshake */
@@ -116,6 +117,12 @@ typedef struct {
 	switch_buffer_t *write_recv_buffer; /* Processed audio from WebSocket to B */
 	switch_mutex_t *audio_mutex;
 
+	/* Per-direction send locks: serialize all writes on a socket (audio frames
+	 * from the send thread vs. Pong/init frames from the recv/connect path) so
+	 * WebSocket frames never interleave and corrupt the stream. */
+	switch_mutex_t *read_send_lock;
+	switch_mutex_t *write_send_lock;
+
 	/* Threading - separate threads for each direction */
 	switch_thread_t *read_send_thread;  /* Sends B's audio to WebSocket */
 	switch_thread_t *read_recv_thread;  /* Receives processed audio for A */
@@ -139,9 +146,9 @@ typedef struct {
 	uint64_t last_frames_dropped;
 	float current_packet_loss_rate;
 
-	/* Frame replacement */
-	switch_frame_t *read_replace_frame;  /* For READ direction */
-	switch_frame_t *write_replace_frame; /* For WRITE direction */
+	/* Teardown guard: cleanup runs exactly once, whether triggered by
+	 * ws_media_stop or by the media-bug CLOSE callback on hangup. */
+	switch_bool_t cleaned_up;
 } ws_media_session_t;
 
 /* WebSocket frame structure */
@@ -173,6 +180,7 @@ static char *base64_encode(const unsigned char *input, int length);
 static void ws_media_fire_event(const char *event_name, ws_media_session_t *session, const char *key, const char *value);
 static void update_packet_loss_stats(ws_media_session_t *session);
 static switch_status_t ws_open_socket(int *ws_socket, const char *direction);
+static void ws_media_cleanup(ws_media_session_t *session);
 
 /* Reliable full-read over a TCP/SSL stream.
  * TCP is a byte-stream protocol — a single recv() may return fewer bytes
@@ -685,6 +693,78 @@ static switch_status_t ws_send_init_packet(ws_media_session_t *session, switch_b
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* A bare IP literal is not a valid SNI host name; detect it so we can skip SNI. */
+static switch_bool_t host_is_ip_literal(const char *h)
+{
+	if (zstr(h)) {
+		return SWITCH_FALSE;
+	}
+	if (strchr(h, ':')) {
+		return SWITCH_TRUE; /* IPv6 */
+	}
+	return (strspn(h, "0123456789.") == strlen(h)) ? SWITCH_TRUE : SWITCH_FALSE;
+}
+
+/* Establish a TLS session on an already-connected socket.
+ * Uses TLS_client_method (SSLv23_* is deprecated), sets SNI for hostnames, and
+ * optionally verifies the server certificate (ws-ssl-verify). On any failure
+ * the SSL/SSL_CTX are freed and the socket is left for the caller to close. */
+static switch_status_t ws_tls_establish(int sock, const char *direction, SSL_CTX **out_ctx, SSL **out_ssl)
+{
+	SSL_CTX *ctx;
+	SSL *ssl;
+
+	*out_ctx = NULL;
+	*out_ssl = NULL;
+
+	ctx = SSL_CTX_new(TLS_client_method());
+	if (!ctx) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "SSL_CTX_new failed for %s\n", direction);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (globals.ws_ssl_verify) {
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+		SSL_CTX_set_default_verify_paths(ctx);
+	}
+
+	if (!(ssl = SSL_new(ctx))) {
+		SSL_CTX_free(ctx);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	SSL_set_fd(ssl, sock);
+
+	if (!host_is_ip_literal(globals.ws_host)) {
+		SSL_set_tlsext_host_name(ssl, globals.ws_host);
+	}
+
+	if (SSL_connect(ssl) != 1) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "TLS handshake failed for %s\n", direction);
+		SSL_free(ssl);
+		SSL_CTX_free(ctx);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (globals.ws_ssl_verify) {
+		long vr = SSL_get_verify_result(ssl);
+		if (vr != X509_V_OK) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+				"TLS certificate verification failed for %s (result=%ld)\n", direction, vr);
+			SSL_free(ssl);
+			SSL_CTX_free(ctx);
+			return SWITCH_STATUS_FALSE;
+		}
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"TLS server certificate NOT verified for %s (set ws-ssl-verify=true to enforce)\n", direction);
+	}
+
+	*out_ctx = ctx;
+	*out_ssl = ssl;
+	return SWITCH_STATUS_SUCCESS;
+}
+
 /* Connect to WebSocket server for READ direction (B -> A) */
 static switch_status_t ws_connect_read(ws_media_session_t *session)
 {
@@ -692,26 +772,11 @@ static switch_status_t ws_connect_read(ws_media_session_t *session)
 		return SWITCH_STATUS_FALSE;
 	}
 	
-	/* SSL connection if needed */
+	/* TLS if needed */
 	if (globals.ws_ssl) {
-		session->read_ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-		if (!session->read_ssl_ctx) {
+		if (ws_tls_establish(session->read_ws_socket, "READ", &session->read_ssl_ctx, &session->read_ssl) != SWITCH_STATUS_SUCCESS) {
 			close(session->read_ws_socket);
 			session->read_ws_socket = -1;
-			return SWITCH_STATUS_FALSE;
-		}
-		
-		session->read_ssl = SSL_new(session->read_ssl_ctx);
-		SSL_set_fd(session->read_ssl, session->read_ws_socket);
-		
-		if (SSL_connect(session->read_ssl) != 1) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "SSL connection failed for READ\n");
-			SSL_free(session->read_ssl);
-			SSL_CTX_free(session->read_ssl_ctx);
-			close(session->read_ws_socket);
-			session->read_ws_socket = -1;
-			session->read_ssl = NULL;
-			session->read_ssl_ctx = NULL;
 			return SWITCH_STATUS_FALSE;
 		}
 	}
@@ -722,17 +787,20 @@ static switch_status_t ws_connect_read(ws_media_session_t *session)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	session->read_connected = 1;
-
-	/* Send initialization packet with media parameters */
+	/* Send the init frame BEFORE marking the direction ready, so the send
+	 * thread (which gates on read_connected) can never emit an audio frame
+	 * ahead of the init text frame. Low-level sends only require a valid
+	 * socket, so the init send below works while read_connected is still 0. */
 	if (ws_send_init_packet(session, SWITCH_TRUE) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 			"Failed to send init packet for READ, but connection established\n");
 		/* Continue anyway - server might not require init packet */
 	}
 
+	session->read_connected = 1;
+
 	ws_media_fire_event(WS_MEDIA_EVENT_CONNECTED, session, "Direction", "READ");
-	
+
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -743,26 +811,11 @@ static switch_status_t ws_connect_write(ws_media_session_t *session)
 		return SWITCH_STATUS_FALSE;
 	}
 	
-	/* SSL connection if needed */
+	/* TLS if needed */
 	if (globals.ws_ssl) {
-		session->write_ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-		if (!session->write_ssl_ctx) {
+		if (ws_tls_establish(session->write_ws_socket, "WRITE", &session->write_ssl_ctx, &session->write_ssl) != SWITCH_STATUS_SUCCESS) {
 			close(session->write_ws_socket);
 			session->write_ws_socket = -1;
-			return SWITCH_STATUS_FALSE;
-		}
-		
-		session->write_ssl = SSL_new(session->write_ssl_ctx);
-		SSL_set_fd(session->write_ssl, session->write_ws_socket);
-		
-		if (SSL_connect(session->write_ssl) != 1) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "SSL connection failed for WRITE\n");
-			SSL_free(session->write_ssl);
-			SSL_CTX_free(session->write_ssl_ctx);
-			close(session->write_ws_socket);
-			session->write_ws_socket = -1;
-			session->write_ssl = NULL;
-			session->write_ssl_ctx = NULL;
 			return SWITCH_STATUS_FALSE;
 		}
 	}
@@ -773,17 +826,17 @@ static switch_status_t ws_connect_write(ws_media_session_t *session)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	session->write_connected = 1;
-
-	/* Send initialization packet with media parameters */
+	/* Send init BEFORE marking ready (see ws_connect_read for rationale). */
 	if (ws_send_init_packet(session, SWITCH_FALSE) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 			"Failed to send init packet for WRITE, but connection established\n");
 		/* Continue anyway - server might not require init packet */
 	}
 
+	session->write_connected = 1;
+
 	ws_media_fire_event(WS_MEDIA_EVENT_CONNECTED, session, "Direction", "WRITE");
-	
+
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -877,6 +930,7 @@ static switch_status_t ws_send_frame_opcode(ws_media_session_t *session, const c
 	int *ws_socket = is_read_direction ? &session->read_ws_socket : &session->write_ws_socket;
 	SSL **ssl = is_read_direction ? &session->read_ssl : &session->write_ssl;
 	int *connected = is_read_direction ? &session->read_connected : &session->write_connected;
+	switch_mutex_t *send_lock = is_read_direction ? session->read_send_lock : session->write_send_lock;
 
 	if (len > 0 && !data) {
 		return SWITCH_STATUS_FALSE;
@@ -887,9 +941,13 @@ static switch_status_t ws_send_frame_opcode(ws_media_session_t *session, const c
 		return SWITCH_STATUS_FALSE;
 	}
 
-	if (!*connected || *ws_socket < 0) {
+	/* Only require a live socket, NOT *connected: the init frame is sent from
+	 * ws_connect_* before the direction is marked connected. Audio senders gate
+	 * on *_connected separately. */
+	if (*ws_socket < 0) {
 		return SWITCH_STATUS_FALSE;
 	}
+	(void)connected;
 
 	/* FIN=1, caller-provided opcode */
 	frame[0] = 0x80 | (opcode & 0x0F);
@@ -936,8 +994,16 @@ static switch_status_t ws_send_frame_opcode(ws_media_session_t *session, const c
 		header_len = 14;
 	}
 
+	/* Serialize the whole header+payload write so a concurrent send on the same
+	 * socket (audio from the send thread vs. Pong/init from the recv/connect
+	 * path) cannot interleave and corrupt WebSocket framing. */
+	if (send_lock) {
+		switch_mutex_lock(send_lock);
+	}
+
 	/* Send frame header */
 	if (send_exact(*ws_socket, *ssl, frame, header_len) < 0) {
+		if (send_lock) switch_mutex_unlock(send_lock);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -955,10 +1021,15 @@ static switch_status_t ws_send_frame_opcode(ws_media_session_t *session, const c
 		}
 
 		if (send_exact(*ws_socket, *ssl, chunk, (int)chunk_len) < 0) {
+			if (send_lock) switch_mutex_unlock(send_lock);
 			return SWITCH_STATUS_FALSE;
 		}
 
 		offset += chunk_len;
+	}
+
+	if (send_lock) {
+		switch_mutex_unlock(send_lock);
 	}
 
 	session->bytes_sent += len;
@@ -987,9 +1058,10 @@ static switch_status_t ws_recv_frame(ws_media_session_t *session, char **data, s
 		*len = 0;
 	}
 
-	if (!*connected || *ws_socket < 0) {
+	if (*ws_socket < 0) {
 		return SWITCH_STATUS_FALSE;
 	}
+	(void)connected;
 
 	/* Read 2-byte base header */
 	{
@@ -1326,6 +1398,12 @@ static void *SWITCH_THREAD_FUNC read_recv_thread(switch_thread_t *thread, void *
 		return NULL;
 	}
 
+	/* Establish the initial READ connection here so call setup is never blocked.
+	 * On failure the reconnect logic in the loop below retries. */
+	if (session->running && !session->bypass_mode) {
+		ws_connect_read(session);
+	}
+
 	while (session->running && switch_channel_up(channel)) {
 		uint8_t recv_opcode = 0;
 		switch_status_t recv_status;
@@ -1436,6 +1514,12 @@ static void *SWITCH_THREAD_FUNC write_recv_thread(switch_thread_t *thread, void 
 		return NULL;
 	}
 
+	/* Establish the initial WRITE connection here so call setup is never blocked.
+	 * On failure the reconnect logic in the loop below retries. */
+	if (session->running && !session->bypass_mode) {
+		ws_connect_write(session);
+	}
+
 	while (session->running && switch_channel_up(channel)) {
 		uint8_t recv_opcode = 0;
 		switch_status_t recv_status;
@@ -1529,13 +1613,71 @@ static void *SWITCH_THREAD_FUNC write_recv_thread(switch_thread_t *thread, void 
 	return NULL;
 }
 
+/* Tear down a ws_media session: stop threads, close sockets, free buffers.
+ * Runs exactly once (guarded by cleaned_up); safe to call from either
+ * ws_media_stop_app or the media-bug CLOSE callback. */
+static void ws_media_cleanup(ws_media_session_t *session)
+{
+	switch_status_t retval;
+
+	if (!session || session->cleaned_up) {
+		return;
+	}
+	session->cleaned_up = SWITCH_TRUE;
+
+	session->running = SWITCH_FALSE;
+	if (!session->stop_time) {
+		session->stop_time = switch_micro_time_now();
+	}
+
+	/* Unblock any thread parked in recv()/send() so the joins below are prompt. */
+	ws_signal_disconnect_read(session);
+	ws_signal_disconnect_write(session);
+
+	if (session->read_send_thread) {
+		switch_thread_join(&retval, session->read_send_thread);
+		session->read_send_thread = NULL;
+	}
+	if (session->read_recv_thread) {
+		switch_thread_join(&retval, session->read_recv_thread);
+		session->read_recv_thread = NULL;
+	}
+	if (session->write_send_thread) {
+		switch_thread_join(&retval, session->write_send_thread);
+		session->write_send_thread = NULL;
+	}
+	if (session->write_recv_thread) {
+		switch_thread_join(&retval, session->write_recv_thread);
+		session->write_recv_thread = NULL;
+	}
+
+	/* Full socket/SSL teardown now that no worker thread can touch them. */
+	ws_disconnect_read(session);
+	ws_disconnect_write(session);
+
+	if (session->read_send_buffer) {
+		switch_buffer_destroy(&session->read_send_buffer);
+	}
+	if (session->read_recv_buffer) {
+		switch_buffer_destroy(&session->read_recv_buffer);
+	}
+	if (session->write_send_buffer) {
+		switch_buffer_destroy(&session->write_send_buffer);
+	}
+	if (session->write_recv_buffer) {
+		switch_buffer_destroy(&session->write_recv_buffer);
+	}
+
+	ws_media_fire_event(WS_MEDIA_EVENT_STOP, session, NULL, NULL);
+}
+
 /* Media bug callback - handles both READ and WRITE directions */
 static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
 {
 	ws_media_session_t *session = (ws_media_session_t *)user_data;
 	switch_frame_t *frame = NULL;
 
-	if (!session || !session->running) {
+	if (!session) {
 		return SWITCH_FALSE;
 	}
 
@@ -1546,11 +1688,18 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 		return SWITCH_TRUE;
 	}
 
-	/* Handle CLOSE event */
+	/* Handle CLOSE event — always run teardown here (not gated on ->running) so
+	 * an abnormal hangup with no explicit ws_media_stop still joins threads and
+	 * frees the per-call buffers. Idempotent via cleaned_up. */
 	if (type == SWITCH_ABC_TYPE_CLOSE) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
 			"Media bug callback CLOSE event received\n");
+		ws_media_cleanup(session);
 		return SWITCH_TRUE;
+	}
+
+	if (!session->running) {
+		return SWITCH_FALSE;
 	}
 
 	/* Bypass mode: audio passes through without processing */
@@ -1578,22 +1727,15 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 					switch_mutex_unlock(session->audio_mutex);
 				}
 
-				/* Try to get processed audio from buffer for A */
+				/* Inject processed audio for A. The replace frame is valid only
+				 * within this callback: overwrite its data in place and set it
+				 * back — never cache the pointer across callbacks. */
 				switch_mutex_lock(session->audio_mutex);
 				if (switch_buffer_inuse(session->read_recv_buffer) >= frame->datalen) {
-					if (!session->read_replace_frame) {
-						session->read_replace_frame = switch_core_media_bug_get_read_replace_frame(bug);
-					}
-
-					if (session->read_replace_frame) {
-						switch_buffer_read(session->read_recv_buffer, session->read_replace_frame->data, frame->datalen);
-						switch_core_media_bug_set_read_replace_frame(bug, session->read_replace_frame);
-					}
-				} else {
-					/* No processed audio available, pass through original */
-					switch_mutex_unlock(session->audio_mutex);
-					return SWITCH_TRUE;
+					switch_buffer_read(session->read_recv_buffer, frame->data, frame->datalen);
+					switch_core_media_bug_set_read_replace_frame(bug, frame);
 				}
+				/* else: not enough processed audio yet — leave the original frame */
 				switch_mutex_unlock(session->audio_mutex);
 			}
 		}
@@ -1615,22 +1757,15 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 					switch_mutex_unlock(session->audio_mutex);
 				}
 
-				/* Try to get processed audio from buffer for B */
+				/* Inject processed audio for B. The replace frame is valid only
+				 * within this callback: overwrite its data in place and set it
+				 * back — never cache the pointer across callbacks. */
 				switch_mutex_lock(session->audio_mutex);
 				if (switch_buffer_inuse(session->write_recv_buffer) >= frame->datalen) {
-					if (!session->write_replace_frame) {
-						session->write_replace_frame = switch_core_media_bug_get_write_replace_frame(bug);
-					}
-
-					if (session->write_replace_frame) {
-						switch_buffer_read(session->write_recv_buffer, session->write_replace_frame->data, frame->datalen);
-						switch_core_media_bug_set_write_replace_frame(bug, session->write_replace_frame);
-					}
-				} else {
-					/* No processed audio available, pass through original */
-					switch_mutex_unlock(session->audio_mutex);
-					return SWITCH_TRUE;
+					switch_buffer_read(session->write_recv_buffer, frame->data, frame->datalen);
+					switch_core_media_bug_set_write_replace_frame(bug, frame);
 				}
+				/* else: not enough processed audio yet — leave the original frame */
 				switch_mutex_unlock(session->audio_mutex);
 			}
 		}
@@ -1690,9 +1825,6 @@ SWITCH_STANDARD_APP(ws_media_start_app)
 	switch_bool_t serial_mode = SWITCH_TRUE;  /* Default to serial mode */
 	switch_codec_implementation_t read_impl = {0};
 	switch_codec_implementation_t write_impl = {0};
-	switch_bool_t read_connected = SWITCH_FALSE;
-	switch_bool_t write_connected = SWITCH_FALSE;
-	int retries;
 
 	if (!fs_session) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Session is NULL\n");
@@ -1833,6 +1965,11 @@ SWITCH_STANDARD_APP(ws_media_start_app)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create audio_mutex\n");
 		goto error;
 	}
+	if (switch_mutex_init(&ws_session->read_send_lock, SWITCH_MUTEX_UNNESTED, switch_core_session_get_pool(fs_session)) != SWITCH_STATUS_SUCCESS ||
+		switch_mutex_init(&ws_session->write_send_lock, SWITCH_MUTEX_UNNESTED, switch_core_session_get_pool(fs_session)) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to create send locks\n");
+		goto error;
+	}
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Buffers and mutex created successfully\n");
 
@@ -1852,68 +1989,11 @@ SWITCH_STANDARD_APP(ws_media_start_app)
 		"Media bug flags: %d (serial_mode=%d, using SMBF_BOTH=%d)\n",
 		flags, serial_mode, (flags == (SMBF_BOTH | SMBF_NO_PAUSE)));
 
-	/* Connect to WebSocket for both directions - try initial connections */
-	read_connected = SWITCH_FALSE;
-	write_connected = SWITCH_FALSE;
-
-	// Connect READ direction (B -> A)
-	if (ws_connect_read(ws_session) != SWITCH_STATUS_SUCCESS) {
-		ws_session->read_retry_count++;
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-			"Initial READ WebSocket connection failed, retry %d/%d\n",
-			ws_session->read_retry_count, globals.max_retry_count);
-
-		retries = 0;
-		while (retries < globals.max_retry_count - 1 && ws_session->running) {
-			switch_yield(globals.reconnect_interval * 1000000);
-			if (ws_connect_read(ws_session) == SWITCH_STATUS_SUCCESS) {
-				ws_session->read_retry_count = 0;
-				read_connected = SWITCH_TRUE;
-				break;
-			}
-			ws_session->read_retry_count++;
-			retries++;
-		}
-	} else {
-		ws_session->read_retry_count = 0;
-		read_connected = SWITCH_TRUE;
-	}
-
-	// Connect WRITE direction (A -> B)
-	if (ws_connect_write(ws_session) != SWITCH_STATUS_SUCCESS) {
-		ws_session->write_retry_count++;
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-			"Initial WRITE WebSocket connection failed, retry %d/%d\n",
-			ws_session->write_retry_count, globals.max_retry_count);
-
-		retries = 0;
-		while (retries < globals.max_retry_count - 1 && ws_session->running) {
-			switch_yield(globals.reconnect_interval * 1000000);
-			if (ws_connect_write(ws_session) == SWITCH_STATUS_SUCCESS) {
-				ws_session->write_retry_count = 0;
-				write_connected = SWITCH_TRUE;
-				break;
-			}
-			ws_session->write_retry_count++;
-			retries++;
-		}
-	} else {
-		ws_session->write_retry_count = 0;
-		write_connected = SWITCH_TRUE;
-	}
-
-	// If both connections failed after retries, switch to bypass mode
-	if (!read_connected && !write_connected) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-			"Both WebSocket connections failed after retries, switching to bypass mode\n");
-		ws_session->bypass_mode = SWITCH_TRUE;
-		ws_media_fire_event(WS_MEDIA_EVENT_ERROR, ws_session, "Error", "Both connections failed, bypass mode enabled");
-	} else {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-			"WebSocket connections established - READ: %s, WRITE: %s\n",
-			read_connected ? "connected" : "failed",
-			write_connected ? "connected" : "failed");
-	}
+	/* NOTE: the WebSocket connections are established by the receive threads,
+	 * NOT here. Connecting on the dialplan/API thread would block call setup for
+	 * seconds on a slow/unreachable backend. Each receive thread connects
+	 * immediately on start and owns reconnect/bypass for its direction; the send
+	 * threads and the media-bug callback only enqueue audio once *_connected. */
 
 	/* Add media bug BEFORE starting threads */
 	status = switch_core_media_bug_add(fs_session, "ws_media", NULL, ws_media_callback, ws_session, 0, flags, &bug);
@@ -1990,82 +2070,29 @@ SWITCH_STANDARD_APP(ws_media_stop_app)
 {
 	switch_media_bug_t *bug = NULL;
 	switch_channel_t *channel;
-	ws_media_session_t *ws_session = NULL;
 	switch_core_session_t *fs_session = session;
-	
+
 	if (!fs_session) {
 		return;
 	}
-	
+
 	channel = switch_core_session_get_channel(fs_session);
 	if (!channel) {
 		return;
 	}
-	
+
 	bug = (switch_media_bug_t *)switch_channel_get_private(channel, "_ws_media_");
 	if (!bug) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Media processing not running on channel %s\n", switch_channel_get_name(channel));
 		return;
 	}
-	
-	ws_session = (ws_media_session_t *)switch_core_media_bug_get_user_data(bug);
-	if (!ws_session) {
-		switch_channel_set_private(channel, "_ws_media_", NULL);
-		switch_core_media_bug_remove(fs_session, &bug);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Media processing bug had no session data on channel %s\n", switch_channel_get_name(channel));
-		return;
-	}
 
-	if (ws_session) {
-		ws_session->running = SWITCH_FALSE;
-		ws_session->stop_time = switch_micro_time_now();
-
-		/* Shutdown sockets first so blocking recv() exits; defer SSL/free/close
-		 * cleanup until after the worker threads are joined. */
-		ws_signal_disconnect_read(ws_session);
-		ws_signal_disconnect_write(ws_session);
-
-		/* Now safe to join — all threads will see running==FALSE and
-		 * disconnected sockets, so they will return promptly. */
-		if (ws_session->read_send_thread) {
-			switch_status_t retval;
-			switch_thread_join(&retval, ws_session->read_send_thread);
-		}
-		if (ws_session->read_recv_thread) {
-			switch_status_t retval;
-			switch_thread_join(&retval, ws_session->read_recv_thread);
-		}
-		if (ws_session->write_send_thread) {
-			switch_status_t retval;
-			switch_thread_join(&retval, ws_session->write_send_thread);
-		}
-		if (ws_session->write_recv_thread) {
-			switch_status_t retval;
-			switch_thread_join(&retval, ws_session->write_recv_thread);
-		}
-
-		ws_disconnect_read(ws_session);
-		ws_disconnect_write(ws_session);
-
-		switch_channel_set_private(channel, "_ws_media_", NULL);
-		switch_core_media_bug_remove(fs_session, &bug);
-		
-		/* Cleanup buffers */
-		if (ws_session->read_send_buffer) {
-			switch_buffer_destroy(&ws_session->read_send_buffer);
-		}
-		if (ws_session->read_recv_buffer) {
-			switch_buffer_destroy(&ws_session->read_recv_buffer);
-		}
-		if (ws_session->write_send_buffer) {
-			switch_buffer_destroy(&ws_session->write_send_buffer);
-		}
-		if (ws_session->write_recv_buffer) {
-			switch_buffer_destroy(&ws_session->write_recv_buffer);
-		}
-		
-		ws_media_fire_event(WS_MEDIA_EVENT_STOP, ws_session, NULL, NULL);
-	}
+	/* Clear the handle, then remove the bug. Removal fires the CLOSE callback,
+	 * which runs ws_media_cleanup() — the single teardown path (join threads,
+	 * close sockets, free buffers). This is also what runs on an abnormal
+	 * hangup where ws_media_stop is never called. */
+	switch_channel_set_private(channel, "_ws_media_", NULL);
+	switch_core_media_bug_remove(fs_session, &bug);
 	
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "Media processing stopped on channel %s\n", switch_channel_get_name(channel));
 }
@@ -2141,6 +2168,7 @@ static switch_status_t load_config(switch_bool_t reload)
 	globals.ws_port = 8080;
 	globals.ws_path = "/media";
 	globals.ws_ssl = 0;
+	globals.ws_ssl_verify = 0; /* off by default; enable to enforce cert validation */
 	globals.ws_auth_user = NULL;
 	globals.ws_auth_pass = NULL;
 	globals.ws_query_params = NULL;
@@ -2167,6 +2195,8 @@ static switch_status_t load_config(switch_bool_t reload)
 					globals.ws_path = switch_core_strdup(pool, value);
 				} else if (!strcmp(name, "ws-ssl")) {
 					globals.ws_ssl = switch_true(value);
+				} else if (!strcmp(name, "ws-ssl-verify")) {
+					globals.ws_ssl_verify = switch_true(value);
 				} else if (!strcmp(name, "ws-auth-user")) {
 					globals.ws_auth_user = switch_core_strdup(pool, value);
 				} else if (!strcmp(name, "ws-auth-pass")) {

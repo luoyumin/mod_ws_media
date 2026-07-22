@@ -166,6 +166,7 @@ To autoload on startup, add to `autoload_configs/modules.conf.xml`:
     <param name="ws-port" value="8080"/>
     <param name="ws-path" value="/media"/>
     <param name="ws-ssl" value="false"/>
+    <param name="ws-ssl-verify" value="false"/>
 
     <!-- optional HTTP Basic auth on the handshake -->
     <!-- <param name="ws-auth-user" value="username"/> -->
@@ -189,6 +190,7 @@ To autoload on startup, add to `autoload_configs/modules.conf.xml`:
 | `ws-port` | `8080` | WebSocket server port |
 | `ws-path` | `/media` | WebSocket path |
 | `ws-ssl` | `false` | Use TLS (`wss://`) |
+| `ws-ssl-verify` | `false` | When TLS is on, verify the server certificate (uses the system trust store). Off logs a warning. |
 | `ws-auth-user` / `ws-auth-pass` | – | HTTP Basic auth (optional) |
 | `ws-query-params` | – | Extra query string on the handshake URL |
 | `max-queue-size` | `8192` | Per-buffer byte cap before dropping |
@@ -320,28 +322,31 @@ FS_CLI=/path/to/fs_cli scripts/check_channel.sh <uuid>
 
 This is why there is no release yet. Contributions welcome.
 
-**Correctness / robustness (must-fix before production):**
+**Fixed on branch `fix/ws_media_p0_bugs` (compiles clean; pending live-call validation):**
 
-- [ ] **Serial mode reuses a cached replace-frame pointer across callbacks** — a
-      replace frame is only valid within its callback; this must
-      `get → memcpy → set` the current frame each time.
-- [ ] **No cleanup on media-bug `CLOSE`** — buffers are freed only on explicit
-      `ws_media_stop`; an abnormal hangup (or API start without stop) leaks the
-      per-call buffers. Cleanup should run in `SWITCH_ABC_TYPE_CLOSE`.
-- [ ] **Concurrent writes to one socket** — the receive thread's Pong reply and
-      the send thread's audio can interleave on the same socket and corrupt
-      framing. Needs a per-direction send lock (or, in send-only/parallel use,
-      drop the receive thread entirely).
-- [ ] **Blocking connect in `ws_media_start`** — initial connection + retries run
-      on the dialplan thread and can stall call setup for seconds; move to the
-      worker threads.
-- [ ] **TLS is not verified** — uses the deprecated `SSLv23_client_method`, does
-      not verify the server certificate, and does not set SNI.
+- [x] **Serial mode cached replace-frame pointer** — now writes the current
+      callback's replace frame in place (`get → memcpy → set`), never cached.
+- [x] **No cleanup on media-bug `CLOSE`** — teardown now runs from
+      `SWITCH_ABC_TYPE_CLOSE` via a single idempotent `ws_media_cleanup()`, so an
+      abnormal hangup (or API start without stop) no longer leaks buffers.
+- [x] **Concurrent writes to one socket** — added a per-direction send lock so
+      audio frames and Pong/init frames can't interleave and corrupt framing.
+- [x] **Blocking connect in `ws_media_start`** — connections are now established
+      by the receive threads; call setup is no longer stalled by a slow backend.
+      (Also fixed an ordering point so audio can't be sent before the init frame.)
+- [x] **TLS hardening** — `TLS_client_method` instead of deprecated
+      `SSLv23_client_method`, SNI set for hostnames, and optional server-cert
+      verification via `ws-ssl-verify` (default off, logs a warning).
+
+**Still open (must-fix / should-fix before production):**
+
 - [ ] **`bypass` is permanent** — once tripped it never recovers for that call.
 - [ ] Statistics counters are updated from multiple threads without atomics, so
       the reported drop rate is unreliable.
 - [ ] Config reload frees the old config pool while active calls may still read
       it; treat reload as unsafe during live calls for now.
+- [ ] Runtime validation under a real FreeSWITCH + live call (this branch has
+      been compile- and link-verified only).
 
 **Enhancements:**
 

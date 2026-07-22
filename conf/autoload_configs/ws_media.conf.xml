@@ -5,14 +5,15 @@
     <param name="ws-port" value="8080"/>
     <param name="ws-path" value="/media"/>
     <param name="ws-ssl" value="false"/>
+    <!-- When ws-ssl is true, verify the server certificate (system trust store) -->
+    <param name="ws-ssl-verify" value="false"/>
 
     <!-- Authentication (optional) -->
     <!-- <param name="ws-auth-user" value="username"/> -->
     <!-- <param name="ws-auth-pass" value="password"/> -->
 
-    <!-- Query parameters for WebSocket handshake (optional) -->
-    <!-- Example: session_id=123&api_key=abc -->
-    <!-- <param name="ws-query-params" value="session_id=123&api_key=abc"/> -->
+    <!-- Query parameters for WebSocket handshake (optional). Escape & as &amp; -->
+    <!-- <param name="ws-query-params" value="session_id=123&amp;api_key=abc"/> -->
 
     <!-- Buffer and latency settings -->
     <param name="max-queue-size" value="8192"/>
