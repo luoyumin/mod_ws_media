@@ -15,6 +15,14 @@
  * third-party service via WebSocket. The processed audio is
  * received back and injected into the call (serial mode), or
  * the audio is copied and sent for analysis without modification (parallel mode).
+ *
+ * Authors:
+ *   LUOYUMIN <luoyumin@meiqia.com>          -- original design & implementation
+ *   Claude (Anthropic, Opus 4.8) <claude>   -- co-author; wrote the P0/P1
+ *       correctness & robustness fixes (replace-frame handling, CLOSE-time
+ *       cleanup, per-direction send locks, async connect + init ordering,
+ *       TLS hardening). See the git history (Co-Authored-By trailers) for
+ *       per-commit attribution.
  */
 
 #include <switch.h>
