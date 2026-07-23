@@ -26,8 +26,18 @@ stats = {
 sessions = {}
 
 
-async def handle_client(websocket, path):
-    """Handle a WebSocket client connection"""
+async def handle_client(websocket, path=None):
+    """Handle a WebSocket client connection.
+
+    Compatible with both old and new `websockets`:
+      - websockets < 11 calls the handler as handler(websocket, path)
+      - websockets >= 14 calls it as handler(websocket) and exposes the request
+        as websocket.request (path -> request.path, headers -> request.headers)
+    """
+    request = getattr(websocket, "request", None)
+    if path is None:
+        path = getattr(request, "path", "") if request is not None else ""
+
     client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
     stats['connections'] += 1
     session_info = {}
@@ -35,8 +45,11 @@ async def handle_client(websocket, path):
     logger.info(f"[{client_id}] New connection (path: {path})")
     logger.info(f"[{client_id}] Total connections: {stats['connections']}")
 
-    # Check for authentication header
-    auth_header = websocket.request_headers.get('Authorization')
+    # Check for authentication header (new API: request.headers; old: request_headers)
+    headers = getattr(request, "headers", None) if request is not None else None
+    if headers is None:
+        headers = getattr(websocket, "request_headers", {})
+    auth_header = headers.get('Authorization')
     if auth_header:
         logger.info(f"[{client_id}] Authentication header: {auth_header}")
         # Parse Basic Auth
