@@ -69,6 +69,12 @@ SWITCH_STANDARD_APP(ws_media_stop_app);
 #define WS_MAX_FRAME_PAYLOAD (1024 * 1024)
 #define WS_MASK_CHUNK_SIZE 4096
 
+/* Statistics counters are updated from the send, receive and media-bug
+ * callback threads. Use relaxed atomics so the reads/writes don't race. */
+#define WS_STAT_INC(x)    __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
+#define WS_STAT_ADD(x, n) __atomic_add_fetch(&(x), (uint64_t)(n), __ATOMIC_RELAXED)
+#define WS_STAT_GET(x)    __atomic_load_n(&(x), __ATOMIC_RELAXED)
+
 /* Configuration */
 typedef struct {
 	char *ws_url;
@@ -84,6 +90,7 @@ typedef struct {
 	int drop_threshold;
 	int reconnect_interval;
 	int max_retry_count;       /* Maximum retry attempts before bypass mode */
+	int bypass_recovery_sec;   /* Seconds in bypass before retrying; 0 = never recover */
 	float packet_loss_threshold; /* Packet loss rate threshold (0.0-1.0) */
 	switch_memory_pool_t *config_pool; /* Pool for config strings — destroyed on reload */
 } ws_media_globals_t;
@@ -140,6 +147,7 @@ typedef struct {
 
 	/* Retry and bypass mode */
 	switch_bool_t bypass_mode;  /* When true, audio passes through without WebSocket processing */
+	switch_time_t bypass_since; /* micro-time bypass was entered; 0 = not in bypass */
 
 	/* Statistics - for packet loss monitoring */
 	uint64_t frames_sent;
@@ -1040,7 +1048,7 @@ static switch_status_t ws_send_frame_opcode(ws_media_session_t *session, const c
 		switch_mutex_unlock(send_lock);
 	}
 
-	session->bytes_sent += len;
+	WS_STAT_ADD(session->bytes_sent, len);
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1176,7 +1184,7 @@ static switch_status_t ws_recv_frame(ws_media_session_t *session, char **data, s
 		return SWITCH_STATUS_SUCCESS;
 	}
 
-	session->bytes_received += payload_len;
+	WS_STAT_ADD(session->bytes_received, payload_len);
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1219,8 +1227,10 @@ static void update_packet_loss_stats(ws_media_session_t *session)
 
 	/* Update stats every 5 seconds */
 	if (elapsed >= 5000000) { /* 5 seconds in microseconds */
-		uint64_t frames_sent_delta = session->frames_sent - session->last_frames_sent;
-		uint64_t frames_dropped_delta = session->frames_dropped - session->last_frames_dropped;
+		uint64_t frames_sent_now = WS_STAT_GET(session->frames_sent);
+		uint64_t frames_dropped_now = WS_STAT_GET(session->frames_dropped);
+		uint64_t frames_sent_delta = frames_sent_now - session->last_frames_sent;
+		uint64_t frames_dropped_delta = frames_dropped_now - session->last_frames_dropped;
 
 		if (frames_sent_delta > 0) {
 			session->current_packet_loss_rate = (float)frames_dropped_delta / (float)frames_sent_delta;
@@ -1239,6 +1249,7 @@ static void update_packet_loss_stats(ws_media_session_t *session)
 						session->current_packet_loss_rate * 100.0,
 						globals.packet_loss_threshold * 100.0);
 					session->bypass_mode = SWITCH_TRUE;
+					session->bypass_since = now;
 					ws_media_fire_event(WS_MEDIA_EVENT_ERROR, session,
 						"Error", "High packet loss rate, bypass mode enabled");
 				}
@@ -1247,9 +1258,47 @@ static void update_packet_loss_stats(ws_media_session_t *session)
 
 		/* Update last stats */
 		session->last_stats_time = now;
-		session->last_frames_sent = session->frames_sent;
-		session->last_frames_dropped = session->frames_dropped;
+		session->last_frames_sent = frames_sent_now;
+		session->last_frames_dropped = frames_dropped_now;
 	}
+}
+
+/* Decide whether to leave bypass mode. Called from the receive threads while
+ * bypassed. When the recovery window has elapsed it clears bypass and resets
+ * the retry/loss counters so the normal (re)connect path runs again. Returns
+ * TRUE if the caller should proceed past the bypass gate (i.e. recovered),
+ * FALSE to keep waiting. bypass-recovery-interval <= 0 disables recovery. */
+static switch_bool_t ws_bypass_try_recover(ws_media_session_t *session)
+{
+	switch_time_t now;
+
+	if (!session->bypass_mode) {
+		return SWITCH_TRUE;
+	}
+	if (globals.bypass_recovery_sec <= 0) {
+		return SWITCH_FALSE;
+	}
+
+	now = switch_micro_time_now();
+	if (session->bypass_since == 0 ||
+		(now - session->bypass_since) < (switch_time_t)globals.bypass_recovery_sec * 1000000) {
+		return SWITCH_FALSE;
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+		"Leaving bypass mode after %ds to retry the WebSocket backend\n",
+		globals.bypass_recovery_sec);
+
+	session->bypass_mode = SWITCH_FALSE;
+	session->bypass_since = 0;
+	session->read_retry_count = 0;
+	session->write_retry_count = 0;
+	/* Reset the packet-loss window so it re-evaluates from scratch. */
+	session->last_stats_time = now;
+	session->last_frames_sent = WS_STAT_GET(session->frames_sent);
+	session->last_frames_dropped = WS_STAT_GET(session->frames_dropped);
+	ws_media_fire_event(WS_MEDIA_EVENT_START, session, "Recovery", "bypass-exit");
+	return SWITCH_TRUE;
 }
 
 /* READ direction send thread - sends B's audio to WebSocket (no direction marker) */
@@ -1287,7 +1336,7 @@ static void *SWITCH_THREAD_FUNC read_send_thread(switch_thread_t *thread, void *
 			if (switch_buffer_inuse(session->read_send_buffer) > (switch_size_t)globals.max_queue_size) {
 				switch_size_t drop_size = switch_buffer_inuse(session->read_send_buffer) - globals.drop_threshold;
 				switch_buffer_toss(session->read_send_buffer, drop_size);
-				session->frames_dropped++;
+				WS_STAT_INC(session->frames_dropped);
 			}
 
 			data_len = switch_buffer_inuse(session->read_send_buffer);
@@ -1306,7 +1355,7 @@ static void *SWITCH_THREAD_FUNC read_send_thread(switch_thread_t *thread, void *
 
 					/* Send pure audio data, no direction marker */
 					if (session->read_connected && ws_send_frame(session, data, data_len, SWITCH_TRUE, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
-						session->frames_sent++;
+						WS_STAT_INC(session->frames_sent);
 					}
 
 					continue;
@@ -1354,7 +1403,7 @@ static void *SWITCH_THREAD_FUNC write_send_thread(switch_thread_t *thread, void 
 			if (switch_buffer_inuse(session->write_send_buffer) > (switch_size_t)globals.max_queue_size) {
 				switch_size_t drop_size = switch_buffer_inuse(session->write_send_buffer) - globals.drop_threshold;
 				switch_buffer_toss(session->write_send_buffer, drop_size);
-				session->frames_dropped++;
+				WS_STAT_INC(session->frames_dropped);
 			}
 
 			data_len = switch_buffer_inuse(session->write_send_buffer);
@@ -1373,7 +1422,7 @@ static void *SWITCH_THREAD_FUNC write_send_thread(switch_thread_t *thread, void 
 
 					/* Send pure audio data, no direction marker */
 					if (session->write_connected && ws_send_frame(session, data, data_len, SWITCH_FALSE, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
-						session->frames_sent++;
+						WS_STAT_INC(session->frames_sent);
 					}
 
 					continue;
@@ -1416,8 +1465,9 @@ static void *SWITCH_THREAD_FUNC read_recv_thread(switch_thread_t *thread, void *
 		uint8_t recv_opcode = 0;
 		switch_status_t recv_status;
 
-		/* Skip receiving if in bypass mode */
-		if (session->bypass_mode) {
+		/* In bypass: keep waiting, or attempt recovery once the window elapses.
+		 * The receive threads own recovery; the send threads just idle-skip. */
+		if (session->bypass_mode && !ws_bypass_try_recover(session)) {
 			switch_yield(100000); /* 100ms */
 			continue;
 		}
@@ -1451,7 +1501,7 @@ static void *SWITCH_THREAD_FUNC read_recv_thread(switch_thread_t *thread, void *
 
 				switch_mutex_unlock(session->audio_mutex);
 
-				session->frames_received++;
+				WS_STAT_INC(session->frames_received);
 				ws_media_fire_event(WS_MEDIA_EVENT_AUDIO_RECEIVED, session, "Direction", "READ");
 			} else {
 				/* Non-binary frame (e.g., text init_ack): log and discard */
@@ -1479,6 +1529,7 @@ static void *SWITCH_THREAD_FUNC read_recv_thread(switch_thread_t *thread, void *
 					"READ WebSocket connection failed after %d retries, switching to bypass mode\n",
 					session->read_retry_count);
 				session->bypass_mode = SWITCH_TRUE;
+				session->bypass_since = switch_micro_time_now();
 				ws_media_fire_event(WS_MEDIA_EVENT_ERROR, session, "Error", "READ max retries reached, bypass mode enabled");
 				break;
 			}
@@ -1532,8 +1583,9 @@ static void *SWITCH_THREAD_FUNC write_recv_thread(switch_thread_t *thread, void 
 		uint8_t recv_opcode = 0;
 		switch_status_t recv_status;
 
-		/* Skip receiving if in bypass mode */
-		if (session->bypass_mode) {
+		/* In bypass: keep waiting, or attempt recovery once the window elapses.
+		 * The receive threads own recovery; the send threads just idle-skip. */
+		if (session->bypass_mode && !ws_bypass_try_recover(session)) {
 			switch_yield(100000); /* 100ms */
 			continue;
 		}
@@ -1567,7 +1619,7 @@ static void *SWITCH_THREAD_FUNC write_recv_thread(switch_thread_t *thread, void 
 
 				switch_mutex_unlock(session->audio_mutex);
 
-				session->frames_received++;
+				WS_STAT_INC(session->frames_received);
 				ws_media_fire_event(WS_MEDIA_EVENT_AUDIO_RECEIVED, session, "Direction", "WRITE");
 			} else {
 				/* Non-binary frame (e.g., text init_ack): log and discard */
@@ -1595,6 +1647,7 @@ static void *SWITCH_THREAD_FUNC write_recv_thread(switch_thread_t *thread, void 
 					"WRITE WebSocket connection failed after %d retries, switching to bypass mode\n",
 					session->write_retry_count);
 				session->bypass_mode = SWITCH_TRUE;
+				session->bypass_since = switch_micro_time_now();
 				ws_media_fire_event(WS_MEDIA_EVENT_ERROR, session, "Error", "WRITE max retries reached, bypass mode enabled");
 				break;
 			}
@@ -1729,7 +1782,7 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 					if (switch_buffer_inuse(session->read_send_buffer) < (switch_size_t)globals.max_queue_size) {
 						switch_buffer_write(session->read_send_buffer, frame->data, frame->datalen);
 					} else {
-						session->frames_dropped++;
+						WS_STAT_INC(session->frames_dropped);
 					}
 
 					switch_mutex_unlock(session->audio_mutex);
@@ -1759,7 +1812,7 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 					if (switch_buffer_inuse(session->write_send_buffer) < (switch_size_t)globals.max_queue_size) {
 						switch_buffer_write(session->write_send_buffer, frame->data, frame->datalen);
 					} else {
-						session->frames_dropped++;
+						WS_STAT_INC(session->frames_dropped);
 					}
 
 					switch_mutex_unlock(session->audio_mutex);
@@ -1790,7 +1843,7 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 				if (switch_buffer_inuse(session->read_send_buffer) < (switch_size_t)globals.max_queue_size) {
 					switch_buffer_write(session->read_send_buffer, frame->data, frame->datalen);
 				} else {
-					session->frames_dropped++;
+					WS_STAT_INC(session->frames_dropped);
 				}
 
 				switch_mutex_unlock(session->audio_mutex);
@@ -1806,7 +1859,7 @@ static switch_bool_t ws_media_callback(switch_media_bug_t *bug, void *user_data,
 				if (switch_buffer_inuse(session->write_send_buffer) < (switch_size_t)globals.max_queue_size) {
 					switch_buffer_write(session->write_send_buffer, frame->data, frame->datalen);
 				} else {
-					session->frames_dropped++;
+					WS_STAT_INC(session->frames_dropped);
 				}
 
 				switch_mutex_unlock(session->audio_mutex);
@@ -2164,10 +2217,14 @@ static switch_status_t load_config(switch_bool_t reload)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	/* Destroy the previous config pool only after the replacement is ready. */
-	if (reload && old_pool) {
-		switch_core_destroy_memory_pool(&old_pool);
-	}
+	/* NOTE: on reload we intentionally do NOT destroy the previous config pool.
+	 * Active calls' worker threads read globals.* (host/port/auth/…) directly
+	 * during reconnects; freeing the old pool could pull a config string out
+	 * from under an in-flight read (use-after-free). We accept a small
+	 * one-pool-per-reload leak (reloads are rare) as the safe choice. The
+	 * proper long-term fix is to snapshot config into each session at
+	 * ws_media_start so threads never touch globals after start. */
+	(void)old_pool;
 
 	memset(&globals, 0, sizeof(globals));
 
@@ -2184,6 +2241,7 @@ static switch_status_t load_config(switch_bool_t reload)
 	globals.drop_threshold = 4096; /* bytes */
 	globals.reconnect_interval = 5; /* seconds */
 	globals.max_retry_count = 3; /* default retry count */
+	globals.bypass_recovery_sec = 30; /* retry backend 30s after entering bypass; 0 = never */
 	globals.packet_loss_threshold = 0.3; /* 30% packet loss threshold */
 
 	if ((xml = switch_xml_open_cfg("ws_media.conf", &cfg, NULL))) {
@@ -2221,6 +2279,11 @@ static switch_status_t load_config(switch_bool_t reload)
 					globals.max_retry_count = atoi(value);
 					if (globals.max_retry_count < 1) {
 						globals.max_retry_count = 1;
+					}
+				} else if (!strcmp(name, "bypass-recovery-interval")) {
+					globals.bypass_recovery_sec = atoi(value);
+					if (globals.bypass_recovery_sec < 0) {
+						globals.bypass_recovery_sec = 0;
 					}
 				} else if (!strcmp(name, "packet-loss-threshold")) {
 					globals.packet_loss_threshold = atof(value);

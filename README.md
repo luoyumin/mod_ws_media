@@ -197,6 +197,7 @@ To autoload on startup, add to `autoload_configs/modules.conf.xml`:
 | `drop-threshold` | `4096` | Target size to trim back to when dropping |
 | `reconnect-interval` | `5` | Seconds between reconnect attempts (also used as socket I/O timeout) |
 | `max-retry-count` | `3` | Reconnect attempts before switching to bypass |
+| `bypass-recovery-interval` | `30` | Seconds to stay in bypass before retrying the backend (`0` = never recover) |
 | `packet-loss-threshold` | `0.3` | Drop-rate (0.0–1.0) above which bypass kicks in |
 
 > All connection settings are currently **global** (module-wide), not per-call.
@@ -338,15 +339,29 @@ This is why there is no release yet. Contributions welcome.
       `SSLv23_client_method`, SNI set for hostnames, and optional server-cert
       verification via `ws-ssl-verify` (default off, logs a warning).
 
-**Still open (must-fix / should-fix before production):**
+**Also fixed on this branch (round 2):**
 
-- [ ] **`bypass` is permanent** — once tripped it never recovers for that call.
-- [ ] Statistics counters are updated from multiple threads without atomics, so
-      the reported drop rate is unreliable.
-- [ ] Config reload frees the old config pool while active calls may still read
-      it; treat reload as unsafe during live calls for now.
-- [ ] Runtime validation under a real FreeSWITCH + live call (this branch has
-      been compile- and link-verified only).
+- [x] **`bypass` no longer permanent** — after `bypass-recovery-interval`
+      seconds the receive threads leave bypass and retry the backend.
+- [x] **Statistics counters are now atomic** — the cross-thread frame/byte
+      counters use relaxed atomics, so the drop-rate reading no longer races.
+- [x] **Config reload no longer frees the in-use config pool** — the old pool
+      is kept (small per-reload leak) so an in-flight reconnect can't hit a
+      use-after-free. (Proper long-term fix: per-session config snapshot.)
+
+**Validated on a live call (2026-07-23):** module attaches to a real SIP call,
+opens the two per-direction WebSocket connections (same call UUID), streams
+audio both ways, and on hangup the `CLOSE` callback runs cleanup and the
+channel destroys cleanly (no crash, no hang). Multi-call leak soak and TLS
+paths still to be exercised.
+
+**Still open:**
+
+- [ ] Send a WebSocket Close frame on teardown (currently just shuts the socket;
+      server logs "no close frame received").
+- [ ] Per-session config snapshot (so reload is fully safe and per-call config
+      becomes possible).
+- [ ] Longer soak: many start/stop cycles watching RSS; `wss://` + auth paths.
 
 **Enhancements:**
 
