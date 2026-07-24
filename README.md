@@ -1,87 +1,58 @@
 # mod_ws_media
 
-A FreeSWITCH module that streams a call's audio to an external service over a
-**WebSocket** in real time, and (optionally) injects processed audio back into
-the call. The transport is raw **L16 PCM** — the server never has to deal with
-the RTP codec. Built for real-time ASR / transcription, translation, recording,
-and audio analytics.
+A FreeSWITCH module that **taps a call leg's audio and streams it to an external
+service over a WebSocket** in real time. The audio is decoded **L16 PCM**, so the
+server never deals with the RTP codec. Built for real-time ASR / transcription,
+recording, and audio analytics.
 
-The module is a self-contained WebSocket client (RFC 6455) implemented directly
-on top of OpenSSL sockets — **no libwebsockets, no gRPC, no extra runtime
-dependencies** beyond OpenSSL.
+Self-contained WebSocket client (RFC 6455) on top of OpenSSL — **no
+libwebsockets, no gRPC, no extra runtime dependencies** beyond OpenSSL.
 
----
-
-> ### ⚠️ Status: pre-release — not production ready
->
-> This module builds and runs, but it has **known correctness/robustness bugs**
-> (see [Known issues & roadmap](#known-issues--roadmap)) and has **not** been
-> validated under production traffic. No tagged release is published yet. Use it
-> for evaluation and development only until the issues below are resolved.
+> **v1.0 — tap only.** This version captures/forks audio out; it is **completely
+> non-intrusive** (read-only, never modifies or injects audio into the call).
+> Injection and cross-leg routing are on the roadmap (see
+> [`docs/DESIGN.md`](docs/DESIGN.md)). Validated on a live call.
 
 ---
-
-## Contents
-
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Build & install](#build--install)
-- [Load the module](#load-the-module)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Processing modes](#processing-modes)
-- [Events](#events)
-- [WebSocket protocol](#websocket-protocol)
-- [Use case: real-time ASR with speaker separation](#use-case-real-time-asr-with-speaker-separation)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Known issues & roadmap](#known-issues--roadmap)
-- [License](#license)
 
 ## Features
 
-- **Two processing modes**
-  - **Parallel** — copy the audio out to the WebSocket without touching the
-    call (recording, ASR, analytics).
-  - **Serial** — replace the call audio with what the server sends back
-    (translation, noise reduction, voice conversion).
-- **Codec-agnostic** — media-bug audio is always decoded 16-bit signed PCM
-  (L16), so the server works the same for PCMU/PCMA/G.722/Opus.
-- **Per-direction connections** — the two audio directions (what the channel
-  hears vs. what it speaks) are streamed on two independent WebSocket
-  connections, which gives you natural speaker separation.
-- **Low-latency by design** — small buffers with an overflow-drop policy that
-  favors latency over completeness.
-- **Graceful degradation** — automatic reconnect, and a *bypass* mode that lets
-  the call continue untouched when the backend is unreachable or the drop rate
-  is too high.
-- **Auth & handshake options** — HTTP Basic auth and custom query parameters on
-  the WebSocket handshake.
-- **Observability** — fires FreeSWITCH CUSTOM events for start/stop/connect/
-  disconnect/error.
-- **TLS** — `wss://` via OpenSSL.
+- **Fork/copy a leg's audio out** over one WebSocket connection per leg —
+  completely non-intrusive to the call.
+- **Per-call configuration** — target URL, capture mode, role and metadata are
+  set per call (command args / channel variables); the global config is only
+  defaults.
+- **Capture modes** (`in=`):
+  - `read` — this leg's own party (its mic; what it *says*) — mono, "self"
+  - `write` — the far party (what this leg *hears*) — mono, "peer"
+  - `mixed` — both parties summed into one mono channel
+  - `stereo` — both parties separated: **left = read (self), right = write
+    (peer)** — natural speaker separation
+- **Codec-agnostic** — media-bug audio is always decoded L16, so it works the
+  same for PCMU/PCMA/G.722/Opus. Sample rate is the channel's native rate.
+- **Graceful degradation** — automatic reconnect, and a recoverable *bypass*
+  mode (the call continues untouched when the backend is unreachable).
+- **TLS** (`wss://`) with optional certificate verification and SNI.
+- **Observability** — FreeSWITCH CUSTOM events for start/stop/connect/error.
 
 ## How it works
 
-The module attaches a [media bug](https://developer.signalwire.com/freeswitch/)
-to the channel. In the bug callback FreeSWITCH hands over **decoded L16 PCM**
-frames, independent of the negotiated RTP codec. Those frames are queued and
-sent to the WebSocket server by dedicated worker threads; in serial mode the
-frames returned by the server are queued back and written into the call.
+The module attaches a FreeSWITCH media bug (stream tap) to the leg. In the
+`READ` callback it pulls decoded, already-synchronized L16 frames via
+`switch_core_media_bug_read` and streams them to the WebSocket server. Direction
+semantics (fixed by FreeSWITCH, verified by live test):
 
-Each call opens **two** WebSocket connections:
+- **READ** = the party on this leg (its microphone) — what the leg *says* → "self".
+- **WRITE** = the far party (what the leg *hears*) → "peer".
+- In `stereo`: **left = read (self), right = write (peer)**.
 
-| Connection | `direction` in init | Captured audio        | Server audio injected into |
-|------------|---------------------|-----------------------|----------------------------|
-| READ       | `read`              | what the channel hears (far end) | near end (serial mode) |
-| WRITE      | `write`             | what the channel speaks (near end) | far end (serial mode) |
+Routing is intentionally kept out of the module: it is a faithful per-leg pipe.
 
 ## Requirements
 
 - FreeSWITCH **1.10.x** (headers to build against).
 - OpenSSL (libssl + libcrypto).
-- A C compiler + `make`. `pkg-config` recommended.
+- A C compiler + `make`; `pkg-config` recommended.
 
 The channel must have a **real media path** — the media bug cannot attach to a
 channel in `bypass_media`/`proxy_media` mode or one that is only `park`ed. Use
@@ -91,285 +62,151 @@ channel in `bypass_media`/`proxy_media` mode or one that is only `park`ed. Use
 
 ### Out-of-tree, against an installed FreeSWITCH (recommended)
 
-If `pkg-config --exists freeswitch` works (i.e. the FreeSWITCH dev headers are
-installed), just:
-
 ```bash
 make
-sudo make install          # installs mod_ws_media.so into FreeSWITCH's module dir
-                           # and ws_media.conf.xml into autoload_configs (if absent)
+sudo make install          # mod_ws_media.so -> module dir; ws_media.conf.xml -> autoload_configs (if absent)
 ```
 
 Point at a specific FreeSWITCH prefix if pkg-config isn't set up:
 
 ```bash
-make            FREESWITCH_PATH=/usr/local/freeswitch
+make              FREESWITCH_PATH=/usr/local/freeswitch
 sudo make install FREESWITCH_PATH=/usr/local/freeswitch
 ```
 
-On **macOS** with Homebrew OpenSSL, expose it to pkg-config first:
+On **macOS** with Homebrew OpenSSL:
 
 ```bash
 export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
 make
 ```
 
-Check what the build system detected at any time:
+### In-tree, like the bundled modules
 
 ```bash
-make print-config
-```
-
-### In-tree, like the bundled modules (mod_unimrcp, …)
-
-To build it as part of a FreeSWITCH **source** tree — the same way the shipped
-modules are built:
-
-```bash
-# 1. put the module where FreeSWITCH expects application modules
 cp -r mod_ws_media <freeswitch-src>/src/mod/applications/mod_ws_media
-#    (or symlink it)
-
-# 2. register it so the build system picks it up
 echo "applications/mod_ws_media" >> <freeswitch-src>/modules.conf
-
-# 3. build (whole tree, or just this module)
-cd <freeswitch-src>
-make
-# or:  cd src/mod/applications/mod_ws_media && make && make install
+cd <freeswitch-src> && make
+# or: cd src/mod/applications/mod_ws_media && make && make install
 ```
 
-`Makefile.am` in this repo is the in-tree build file; the plain `Makefile` is
-the out-of-tree one.
+`Makefile.am` is the in-tree build file; the plain `Makefile` is out-of-tree.
 
-## Load the module
+## Load
 
 ```bash
-fs_cli -x "load mod_ws_media"
-fs_cli -x "module_exists mod_ws_media"     # -> true
+fs_cli -x "load mod_ws_media"        # or: reload mod_ws_media
+fs_cli -x "module_exists mod_ws_media"   # -> true
 ```
-
-To autoload on startup, add to `autoload_configs/modules.conf.xml`:
-
-```xml
-<load module="mod_ws_media"/>
-```
-
-## Configuration
-
-`autoload_configs/ws_media.conf.xml`:
-
-```xml
-<configuration name="ws_media.conf" description="WebSocket Media Bridge Module">
-  <settings>
-    <param name="ws-host" value="localhost"/>
-    <param name="ws-port" value="8080"/>
-    <param name="ws-path" value="/media"/>
-    <param name="ws-ssl" value="false"/>
-    <param name="ws-ssl-verify" value="false"/>
-
-    <!-- optional HTTP Basic auth on the handshake -->
-    <!-- <param name="ws-auth-user" value="username"/> -->
-    <!-- <param name="ws-auth-pass" value="password"/> -->
-
-    <!-- optional query params appended to the handshake URL -->
-    <!-- <param name="ws-query-params" value="session_id=123&amp;api_key=abc"/> -->
-
-    <param name="max-queue-size" value="8192"/>
-    <param name="drop-threshold" value="4096"/>
-    <param name="reconnect-interval" value="5"/>
-    <param name="max-retry-count" value="3"/>
-    <param name="packet-loss-threshold" value="0.3"/>
-  </settings>
-</configuration>
-```
-
-| Param | Default | Meaning |
-|-------|---------|---------|
-| `ws-host` | `localhost` | WebSocket server host |
-| `ws-port` | `8080` | WebSocket server port |
-| `ws-path` | `/media` | WebSocket path |
-| `ws-ssl` | `false` | Use TLS (`wss://`) |
-| `ws-ssl-verify` | `false` | When TLS is on, verify the server certificate (uses the system trust store). Off logs a warning. |
-| `ws-auth-user` / `ws-auth-pass` | – | HTTP Basic auth (optional) |
-| `ws-query-params` | – | Extra query string on the handshake URL |
-| `max-queue-size` | `8192` | Per-buffer byte cap before dropping |
-| `drop-threshold` | `4096` | Target size to trim back to when dropping |
-| `reconnect-interval` | `5` | Seconds between reconnect attempts (also used as socket I/O timeout) |
-| `max-retry-count` | `3` | Reconnect attempts before switching to bypass |
-| `bypass-recovery-interval` | `30` | Seconds to stay in bypass before retrying the backend (`0` = never recover) |
-| `packet-loss-threshold` | `0.3` | Drop-rate (0.0–1.0) above which bypass kicks in |
-
-> All connection settings are currently **global** (module-wide), not per-call.
 
 ## Usage
 
-### Dialplan
+### Dialplan app
 
 ```xml
-<extension name="ws_media_demo">
-  <condition field="destination_number" expression="^9999$">
-    <action application="answer"/>
-    <action application="set" data="ws_media_mode=parallel"/>  <!-- or serial -->
-    <action application="ws_media_start"/>
-    <action application="bridge" data="user/1000"/>
-    <action application="ws_media_stop"/>
-  </condition>
-</extension>
+<action application="ws_media_start" data="ws://127.0.0.1:8080/media in=stereo role=agent"/>
+<!-- ... call proceeds ... -->
+<action application="ws_media_stop"/>
 ```
 
-### API / ESL
+### API (on a live call)
 
 ```bash
-fs_cli -x "uuid_setvar <uuid> ws_media_mode parallel"
-fs_cli -x "uuid_ws_media <uuid> start"
-fs_cli -x "uuid_ws_media <uuid> stop"
+uuid_ws_media <uuid> start ws://127.0.0.1:8080/media in=stereo role=agent call_id=abc123
+uuid_ws_media <uuid> stop
 ```
 
-### originate
+### Channel variables (dialplan-friendly)
 
-```bash
-originate {ws_media_mode=parallel,bypass_media=false}user/1000 &echo
+```
+uuid_setvar <uuid> ws_media_url     ws://127.0.0.1:8080/media
+uuid_setvar <uuid> ws_media_in      stereo
+uuid_setvar <uuid> ws_media_role    agent
+uuid_setvar <uuid> ws_media_call_id abc123
+uuid_setvar <uuid> ws_media_meta    {"tenant":"t1"}
+uuid_ws_media <uuid> start
 ```
 
-## Processing modes
+### Parameters
 
-Set via the channel variable `ws_media_mode`:
+| Command arg | Channel variable | Meaning | Default |
+|---|---|---|---|
+| `ws://…` / `wss://…` | `ws_media_url` | Target URL (host/port/path) | conf `ws-host/port/path` |
+| `in=read\|write\|mixed\|stereo` | `ws_media_in` | Capture mode | `read` |
+| `role=…` | `ws_media_role` | Role label of this leg (into the `start` frame) | `self` |
+| `call_id=…` | `ws_media_call_id` | Your business id (into the `start` frame) | the leg's FS uuid |
+| — | `ws_media_meta` | Arbitrary JSON passed through to the server | `{}` |
 
-| Value | Mode | Effect |
-|-------|------|--------|
-| `serial` / `true` (default) | Serial | Call audio is **replaced** by what the server returns |
-| `parallel` / `false` | Parallel | Call audio is **copied** out; the original stream is untouched; server audio is ignored |
+## Wire protocol
+
+On connect the module sends one JSON **text** frame, then streams **binary** L16
+PCM. (Full/target protocol incl. injection is specified in
+[`docs/DESIGN.md`](docs/DESIGN.md).)
+
+```json
+{
+  "event": "start",
+  "version": "1",
+  "call_id": "abc123",
+  "leg_uuid": "<freeswitch channel uuid>",
+  "attach_mode": "tap",
+  "media_format": { "encoding": "L16", "sample_rate": 8000, "channels": 2, "ptime": 20 },
+  "capture": {
+    "mode": "stereo",
+    "tracks": [
+      { "ch": 0, "source": "read",  "role": "agent" },
+      { "ch": 1, "source": "write", "role": "peer" }
+    ]
+  },
+  "custom": { "tenant": "t1" }
+}
+```
+
+Binary frames: raw signed 16-bit little-endian PCM.
+- `sample_rate` = the channel's native rate (e.g. G.722 → 16000, Opus → 48000).
+- channels: `read`/`write`/`mixed` = 1; `stereo` = 2 (interleaved `[L R L R …]`,
+  left = read/self, right = write/peer).
+- A binary message is **not** guaranteed to be exactly one 20 ms frame; treat it
+  as a byte stream.
 
 ## Events
 
 CUSTOM events, subclass prefix `ws_media::`:
+`start`, `stop`, `connected`, `disconnected`, `error`.
 
-| Event | Notes |
-|-------|-------|
-| `ws_media::start` / `ws_media::stop` | Processing lifecycle |
-| `ws_media::connected` / `ws_media::disconnected` | Per direction (`Direction: READ|WRITE`) |
-| `ws_media::error` | Includes an `Error` header |
-| `ws_media::audio_sent` / `ws_media::audio_received` | Audio flow |
-
-```bash
+```
 fs_cli> /events plain CUSTOM ws_media::start ws_media::stop ws_media::error
 ```
 
-## WebSocket protocol
+## Configuration (`autoload_configs/ws_media.conf.xml` — defaults only)
 
-On connect the module sends one JSON **text** frame describing the stream, then
-streams **binary** L16 PCM frames. Full wire format, framing rules, control
-frames, and a minimal server contract are documented in
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+| Param | Default | Meaning |
+|---|---|---|
+| `ws-host` / `ws-port` / `ws-path` | `localhost` / `8080` / `/media` | Default target |
+| `ws-ssl` | `false` | Use TLS (`wss://`) |
+| `ws-ssl-verify` | `false` | Verify server certificate when TLS is on |
+| `ws-auth-user` / `ws-auth-pass` | – | HTTP Basic auth (optional) |
+| `ws-query-params` | – | Extra query string on the handshake URL |
+| `max-queue-size` | `8192` | Per-buffer byte cap before dropping oldest |
+| `drop-threshold` | `4096` | Target size to trim back to when dropping |
+| `reconnect-interval` | `5` | Seconds between reconnects (and socket I/O timeout) |
+| `max-retry-count` | `3` | Reconnect attempts before bypass |
+| `bypass-recovery-interval` | `30` | Seconds in bypass before retrying (`0` = never) |
 
-```json
-{
-  "type": "init",
-  "uuid": "<channel-uuid>",
-  "direction": "read",
-  "encoding": "L16",
-  "sample_rate": 8000,
-  "channels": 1,
-  "ptime": 20,
-  "bytes_per_frame": 320,
-  "channel_codec": "PCMU"
-}
-```
+Per-call values (URL, capture mode, role, call_id, metadata) come from the
+command / channel variables above and override these defaults.
 
-> A binary WebSocket message is **not** guaranteed to equal one FreeSWITCH audio
-> frame — use `bytes_per_frame` for validation, not as a fixed message size.
+## Roadmap
 
-## Use case: real-time ASR with speaker separation
+- **v1.x — fork only** (this line): `v1.0` tap (read/write/mixed/stereo) ✅;
+  optional capture resampling (default native) — planned, low priority.
+- **v2.x — injection & routing**: inject the server's processed audio back into
+  a chosen leg (same-leg, then cross-leg / cross-call). Enables real-time
+  translation, prompts, agent whisper.
+- **v3.x**: pause/resume, stats API, framed media header, auth extensions
+  (Bearer/mTLS), multiplexing, optional gRPC transport.
 
-For live transcription you want **parallel** mode (never modify the call) and
-you attach the bug to the **agent leg**:
-
-- the **READ** connection carries the *customer* audio (what the agent hears),
-- the **WRITE** connection carries the *agent* audio (what the agent speaks).
-
-Two mono streams, already separated by speaker — feed each to its own streaming
-ASR session. Because the payload is L16, the ASR gateway just resamples if
-needed (e.g. 8 kHz telephony → 16 kHz) and forwards to the recognizer.
-
-> Verify the READ/WRITE ↔ speaker mapping once on your setup during POC; it
-> depends on which leg you attach to.
-
-## Testing
-
-A minimal echo server is included:
-
-```bash
-pip3 install websockets
-python3 test/test_ws_server.py      # listens on 0.0.0.0:8080, echoes audio, logs init
-```
-
-Diagnose a channel that refuses the media bug:
-
-```bash
-FS_CLI=/path/to/fs_cli scripts/check_channel.sh <uuid>
-```
-
-## Troubleshooting
-
-- **`Failed to add media bug (status=9)`** — the channel has no real media path.
-  Avoid `park`; ensure `bypass_media=false` and `proxy_media=false`.
-- **Handshake fails** — check host/port/path and that the server speaks RFC 6455;
-  raise FreeSWITCH log level with `/log 7`.
-- **Choppy injected audio (serial)** — the returned PCM must match the init
-  `sample_rate`/`channels` exactly; consider larger `max-queue-size`.
-
-## Known issues & roadmap
-
-This is why there is no release yet. Contributions welcome.
-
-**Fixed on branch `fix/ws_media_p0_bugs` (compiles clean; pending live-call validation):**
-
-- [x] **Serial mode cached replace-frame pointer** — now writes the current
-      callback's replace frame in place (`get → memcpy → set`), never cached.
-- [x] **No cleanup on media-bug `CLOSE`** — teardown now runs from
-      `SWITCH_ABC_TYPE_CLOSE` via a single idempotent `ws_media_cleanup()`, so an
-      abnormal hangup (or API start without stop) no longer leaks buffers.
-- [x] **Concurrent writes to one socket** — added a per-direction send lock so
-      audio frames and Pong/init frames can't interleave and corrupt framing.
-- [x] **Blocking connect in `ws_media_start`** — connections are now established
-      by the receive threads; call setup is no longer stalled by a slow backend.
-      (Also fixed an ordering point so audio can't be sent before the init frame.)
-- [x] **TLS hardening** — `TLS_client_method` instead of deprecated
-      `SSLv23_client_method`, SNI set for hostnames, and optional server-cert
-      verification via `ws-ssl-verify` (default off, logs a warning).
-
-**Also fixed on this branch (round 2):**
-
-- [x] **`bypass` no longer permanent** — after `bypass-recovery-interval`
-      seconds the receive threads leave bypass and retry the backend.
-- [x] **Statistics counters are now atomic** — the cross-thread frame/byte
-      counters use relaxed atomics, so the drop-rate reading no longer races.
-- [x] **Config reload no longer frees the in-use config pool** — the old pool
-      is kept (small per-reload leak) so an in-flight reconnect can't hit a
-      use-after-free. (Proper long-term fix: per-session config snapshot.)
-
-**Validated on a live call (2026-07-23):** module attaches to a real SIP call,
-opens the two per-direction WebSocket connections (same call UUID), streams
-audio both ways, and on hangup the `CLOSE` callback runs cleanup and the
-channel destroys cleanly (no crash, no hang). Multi-call leak soak and TLS
-paths still to be exercised.
-
-**Still open:**
-
-- [ ] Send a WebSocket Close frame on teardown (currently just shuts the socket;
-      server logs "no close frame received").
-- [ ] Per-session config snapshot (so reload is fully safe and per-call config
-      becomes possible).
-- [ ] Longer soak: many start/stop cycles watching RSS; `wss://` + auth paths.
-
-**Enhancements:**
-
-- [ ] Per-call / per-channel-variable connection settings (URL, auth) instead of
-      global-only config.
-- [ ] Send-only mode that skips the receive threads for pure ASR/recording.
-- [ ] `uuid_ws_media <uuid> stats` command.
-- [ ] Optional single full-duplex connection instead of two.
+Design and target protocol: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## License
 
