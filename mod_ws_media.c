@@ -942,7 +942,9 @@ static switch_media_bug_flag_t capture_flags(ws_capture_t c)
 /* start / stop                                                       */
 /* ------------------------------------------------------------------ */
 
-static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
+/* Returns SWITCH_STATUS_SUCCESS on attach, SWITCH_STATUS_INUSE if this leg
+ * already has a tap, or SWITCH_STATUS_FALSE on any other failure. */
+static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 {
 	switch_channel_t *channel = switch_core_session_get_channel(fs);
 	switch_media_bug_t *bug = NULL;
@@ -951,16 +953,17 @@ static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 	switch_memory_pool_t *pool = switch_core_session_get_pool(fs);
 
 	if (switch_channel_get_private(channel, WS_PRIVATE_KEY)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: already running on %s\n", switch_channel_get_name(channel));
-		return;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: already running on %s (one tap per leg; stop it first)\n", switch_channel_get_name(channel));
+		return SWITCH_STATUS_INUSE;
 	}
 	if (!switch_channel_media_ready(channel)) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: media not ready on %s\n", switch_channel_get_name(channel));
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 	if (switch_channel_test_flag(channel, CF_PROXY_MEDIA) || switch_true(switch_channel_get_variable(channel, "bypass_media"))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: proxy/bypass media, cannot attach on %s\n", switch_channel_get_name(channel));
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 
 	s = switch_core_session_alloc(fs, sizeof(*s));
@@ -972,7 +975,7 @@ static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 
 	if (switch_core_session_get_read_impl(fs, &s->read_impl) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: no read codec impl on %s\n", switch_channel_get_name(channel));
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 
 	resolve_cfg(channel, s, argc, argv);
@@ -980,7 +983,7 @@ static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 
 	if (switch_buffer_create_dynamic(&s->send_buffer, 1024, 8192, 0) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: buffer alloc failed\n");
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 	switch_mutex_init(&s->audio_mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_mutex_init(&s->send_lock, SWITCH_MUTEX_UNNESTED, pool);
@@ -989,7 +992,7 @@ static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 	if (switch_core_media_bug_add(fs, "ws_media", NULL, ws_capture_callback, s, 0, flags, &bug) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: media_bug_add failed on %s\n", switch_channel_get_name(channel));
 		switch_buffer_destroy(&s->send_buffer);
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 	s->bug = bug;
 	switch_channel_set_private(channel, WS_PRIVATE_KEY, bug);
@@ -1006,18 +1009,22 @@ static void ws_media_start(switch_core_session_t *fs, int argc, char **argv)
 		"ws_media: started on %s -> %s://%s:%d%s in=%s ch=%d\n",
 		switch_channel_get_name(channel), s->cfg.ssl ? "wss" : "ws",
 		s->cfg.host, s->cfg.port, s->cfg.path, cap_name(s->capture), s->channels);
+	return SWITCH_STATUS_SUCCESS;
 }
 
-static void ws_media_stop(switch_core_session_t *fs)
+/* Returns SWITCH_STATUS_SUCCESS if a tap was removed, SWITCH_STATUS_FALSE if
+ * none was running on this leg. */
+static switch_status_t ws_media_stop(switch_core_session_t *fs)
 {
 	switch_channel_t *channel = switch_core_session_get_channel(fs);
 	switch_media_bug_t *bug = switch_channel_get_private(channel, WS_PRIVATE_KEY);
 	if (!bug) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: not running on %s\n", switch_channel_get_name(channel));
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 	switch_channel_set_private(channel, WS_PRIVATE_KEY, NULL);
 	switch_core_media_bug_remove(fs, &bug);   /* fires CLOSE -> ws_cleanup */
+	return SWITCH_STATUS_SUCCESS;
 }
 
 SWITCH_STANDARD_APP(ws_media_start_app)
@@ -1047,11 +1054,20 @@ SWITCH_STANDARD_API(ws_media_api)
 		switch_core_session_t *fs = switch_core_session_locate(argv[0]);
 		if (!fs) { stream->write_function(stream, "-ERR No such session\n"); goto done; }
 		if (!strcasecmp(argv[1], "start")) {
-			ws_media_start(fs, argc - 2, &argv[2]);
-			stream->write_function(stream, "+OK\n");
+			switch_status_t st = ws_media_start(fs, argc - 2, &argv[2]);
+			if (st == SWITCH_STATUS_SUCCESS) {
+				stream->write_function(stream, "+OK\n");
+			} else if (st == SWITCH_STATUS_INUSE) {
+				stream->write_function(stream, "-ERR already running on this leg (one tap per leg; stop it first)\n");
+			} else {
+				stream->write_function(stream, "-ERR failed to start (check media path / see log)\n");
+			}
 		} else if (!strcasecmp(argv[1], "stop")) {
-			ws_media_stop(fs);
-			stream->write_function(stream, "+OK\n");
+			if (ws_media_stop(fs) == SWITCH_STATUS_SUCCESS) {
+				stream->write_function(stream, "+OK\n");
+			} else {
+				stream->write_function(stream, "-ERR not running on this leg\n");
+			}
 		} else {
 			stream->write_function(stream, "-ERR Invalid command\n");
 		}
