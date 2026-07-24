@@ -26,8 +26,8 @@
     <!-- Seconds to stay in bypass before retrying the backend (0 = never recover) -->
     <param name="bypass-recovery-interval" value="30"/>
 
-    <!-- Packet loss threshold (0.0-1.0, e.g., 0.3 = 30%) -->
-    <!-- If packet loss exceeds this threshold, bypass mode is enabled -->
-    <param name="packet-loss-threshold" value="0.3"/>
+    <!-- NOTE: these are DEFAULTS. Per-call overrides come from the start
+         command / channel variables (ws_media_url, ws_media_in, ws_media_role,
+         ws_media_call_id, ws_media_meta). See docs/DESIGN.md. -->
   </settings>
 </configuration>
