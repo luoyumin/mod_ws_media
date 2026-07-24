@@ -588,16 +588,23 @@ static switch_status_t ws_send_start(ws_session_t *s)
 	char tracks[512];
 	int rate = s->read_impl.actual_samples_per_second;
 	int ptime = s->read_impl.microseconds_per_packet / 1000;
+	const char *self_role = s->role ? s->role : "self";
 
+	/* Direction semantics (see switch_core_media_bug_read):
+	 *   READ  = the party ON THIS leg  (its own microphone)  -> "self" role
+	 *   WRITE = the far party (what this leg hears)           -> "peer" role
+	 * With SMBF_STEREO: left = read, right = write. */
 	if (s->capture == CAP_STEREO) {
 		snprintf(tracks, sizeof(tracks),
-			"[{\"ch\":0,\"source\":\"read\",\"role\":\"peer\"},"
-			"{\"ch\":1,\"source\":\"write\",\"role\":\"%s\"}]",
-			s->role ? s->role : "self");
+			"[{\"ch\":0,\"source\":\"read\",\"role\":\"%s\"},"
+			"{\"ch\":1,\"source\":\"write\",\"role\":\"peer\"}]",
+			self_role);
 	} else {
+		const char *role = (s->capture == CAP_READ) ? self_role :
+		                   (s->capture == CAP_WRITE) ? "peer" : "mixed";
 		snprintf(tracks, sizeof(tracks),
 			"[{\"ch\":0,\"source\":\"%s\",\"role\":\"%s\"}]",
-			cap_name(s->capture), s->role ? s->role : "self");
+			cap_name(s->capture), role);
 	}
 
 	snprintf(pkt, sizeof(pkt),
