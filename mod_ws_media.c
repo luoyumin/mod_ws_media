@@ -1125,11 +1125,22 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_ws_media_load)
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 	if (load_config(SWITCH_FALSE) != SWITCH_STATUS_SUCCESS) return SWITCH_STATUS_FALSE;
 
-	SWITCH_ADD_API(api_interface, "uuid_ws_media", "WebSocket media tap", ws_media_api, "<uuid> <start|stop> [opts]");
+	SWITCH_ADD_API(api_interface, "uuid_ws_media", "WebSocket media tap", ws_media_api,
+		"<uuid> start [ws-url] [in=read|write|mixed|stereo] [role=<label>] [call_id=<id>] | <uuid> stop");
 	SWITCH_ADD_APP(app_interface, "ws_media_start", "Start WebSocket media tap", "Start WebSocket media tap",
-		ws_media_start_app, "[ws-url] [in=read|write|mixed|stereo] [role=..] [call_id=..]", SAF_NONE);
+		ws_media_start_app, "[ws-url] [in=read|write|mixed|stereo] [role=<label>] [call_id=<id>]", SAF_NONE);
 	SWITCH_ADD_APP(app_interface, "ws_media_stop", "Stop WebSocket media tap", "Stop WebSocket media tap",
 		ws_media_stop_app, "", SAF_NONE);
+
+	/* fs_cli TAB completion: complete the uuid from active calls, then the verb
+	 * and the capture-mode option. (URL/role/call_id are free-form and can't be
+	 * completed positionally.) */
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=read");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=write");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=mixed");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=stereo");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid stop");
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_ws_media (v1 tap) loaded\n");
 	return SWITCH_STATUS_SUCCESS;
@@ -1137,6 +1148,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_ws_media_load)
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_ws_media_shutdown)
 {
+	switch_console_set_complete("del uuid_ws_media");
 	if (globals.config_pool) switch_core_destroy_memory_pool(&globals.config_pool);
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_ws_media unloaded\n");
 	return SWITCH_STATUS_SUCCESS;
