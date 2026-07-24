@@ -1,170 +1,159 @@
 #!/usr/bin/env python3
 """
-Test WebSocket server for mod_ws_media
-This is a simple echo server that receives audio and sends it back.
+Test WebSocket server for mod_ws_media (v1 tap protocol).
+
+Behaviour:
+  - Reads the first text frame as the v1 `start` control message and learns the
+    media format (sample_rate / channels), capture mode and per-channel roles.
+  - Writes the received binary L16 PCM into WAV file(s) under ./recordings/:
+      * mono  (in=read|write|mixed) -> one file
+      * stereo(in=stereo)           -> de-interleaved into two mono files
+        (left / right), named with the track roles so you can verify the
+        speaker<->channel mapping by ear.
+  - Prints throughput stats. It does NOT echo audio back (v1 is tap-only).
+
+Compatible with websockets >= 14 (incl. 16.x) and older.
 """
 
 import asyncio
-import websockets
-import base64
-import logging
 import json
+import logging
+import os
+import time
+import wave
+
+import websockets
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Statistics
-stats = {
-    'connections': 0,
-    'bytes_received': 0,
-    'bytes_sent': 0,
-    'frames_received': 0,
-    'frames_sent': 0
-}
+REC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
-# Store session info
-sessions = {}
+
+def _safe(name):
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in (name or "x"))
+
+
+class WavSink:
+    """Writes incoming (possibly stereo-interleaved) L16 to one or two mono WAVs."""
+
+    def __init__(self, call_id, sample_rate, channels, mode, tracks):
+        os.makedirs(REC_DIR, exist_ok=True)
+        self.channels = channels if channels in (1, 2) else 1
+        self.rate = sample_rate or 8000
+        self.leftover = b""
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        base = f"{_safe(call_id)}_{ts}"
+
+        def role_of(ch, default):
+            for t in (tracks or []):
+                if t.get("ch") == ch:
+                    return t.get("role", default)
+            return default
+
+        if self.channels == 2:
+            l = os.path.join(REC_DIR, f"{base}_left-{_safe(role_of(0, 'ch0'))}.wav")
+            r = os.path.join(REC_DIR, f"{base}_right-{_safe(role_of(1, 'ch1'))}.wav")
+            self.writers = [self._open(l), self._open(r)]
+            self.paths = [l, r]
+        else:
+            p = os.path.join(REC_DIR, f"{base}_{_safe(mode or 'mono')}.wav")
+            self.writers = [self._open(p)]
+            self.paths = [p]
+        logger.info("Recording -> %s", ", ".join(self.paths))
+
+    def _open(self, path):
+        w = wave.open(path, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)   # L16
+        w.setframerate(self.rate)
+        return w
+
+    def write(self, data):
+        buf = self.leftover + data
+        if self.channels == 2:
+            n = len(buf) - (len(buf) % 4)          # whole L/R sample-pairs (4 bytes)
+            frame, self.leftover = buf[:n], buf[n:]
+            # de-interleave [L R L R ...]
+            left = b"".join(frame[i:i + 2] for i in range(0, n, 4))
+            right = b"".join(frame[i + 2:i + 4] for i in range(0, n, 4))
+            self.writers[0].writeframes(left)
+            self.writers[1].writeframes(right)
+        else:
+            n = len(buf) - (len(buf) % 2)          # whole samples (2 bytes)
+            frame, self.leftover = buf[:n], buf[n:]
+            self.writers[0].writeframes(frame)
+
+    def close(self):
+        for w in self.writers:
+            try:
+                w.close()
+            except Exception:
+                pass
 
 
 async def handle_client(websocket, path=None):
-    """Handle a WebSocket client connection.
-
-    Compatible with both old and new `websockets`:
-      - websockets < 11 calls the handler as handler(websocket, path)
-      - websockets >= 14 calls it as handler(websocket) and exposes the request
-        as websocket.request (path -> request.path, headers -> request.headers)
-    """
     request = getattr(websocket, "request", None)
     if path is None:
         path = getattr(request, "path", "") if request is not None else ""
+    client = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+    logger.info("[%s] connection open (path: %s)", client, path)
 
-    client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-    stats['connections'] += 1
-    session_info = {}
-
-    logger.info(f"[{client_id}] New connection (path: {path})")
-    logger.info(f"[{client_id}] Total connections: {stats['connections']}")
-
-    # Check for authentication header (new API: request.headers; old: request_headers)
-    headers = getattr(request, "headers", None) if request is not None else None
-    if headers is None:
-        headers = getattr(websocket, "request_headers", {})
-    auth_header = headers.get('Authorization')
-    if auth_header:
-        logger.info(f"[{client_id}] Authentication header: {auth_header}")
-        # Parse Basic Auth
-        if auth_header.startswith('Basic '):
-            try:
-                encoded = auth_header[6:]
-                decoded = base64.b64decode(encoded).decode('utf-8')
-                username, password = decoded.split(':', 1)
-                logger.info(f"[{client_id}] Username: {username}, Password: {'*' * len(password)}")
-            except Exception as e:
-                logger.error(f"[{client_id}] Failed to parse auth header: {e}")
-
-    # Log query parameters
-    if '?' in path:
-        query_string = path.split('?', 1)[1]
-        logger.info(f"[{client_id}] Query parameters: {query_string}")
-
+    sink = None
+    started = False
+    frames = 0
+    total_bytes = 0
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                # Binary data (audio)
-                stats['bytes_received'] += len(message)
-                stats['frames_received'] += 1
-
-                logger.debug(f"[{client_id}] Received {len(message)} bytes of audio data")
-
-                # Echo the audio back
-                # In a real application, you would process the audio here
-                # For example: translate, denoise, or analyze
-
-                await websocket.send(message)
-
-                stats['bytes_sent'] += len(message)
-                stats['frames_sent'] += 1
-
-                # Log statistics every 100 frames
-                if stats['frames_received'] % 100 == 0:
-                    logger.info(f"[{client_id}] Stats: "
-                              f"RX: {stats['frames_received']} frames ({stats['bytes_received']} bytes), "
-                              f"TX: {stats['frames_sent']} frames ({stats['bytes_sent']} bytes)")
+                total_bytes += len(message)
+                frames += 1
+                if sink is None:
+                    # binary before start: assume mono 8k
+                    logger.warning("[%s] audio before start; defaulting mono/8000", client)
+                    sink = WavSink("nostart", 8000, 1, "mono", [])
+                sink.write(message)
+                if frames % 100 == 0:
+                    logger.info("[%s] RX %d frames (%d bytes)", client, frames, total_bytes)
             else:
-                # Text message - check if it's an init packet
-                logger.info(f"[{client_id}] Received text message: {message}")
-
+                logger.info("[%s] text: %s", client, message)
+                if started:
+                    continue
                 try:
-                    data = json.loads(message)
-                    if data.get('type') == 'init':
-                        # Store session initialization info
-                        session_info = {
-                            'uuid': data.get('uuid'),
-                            'direction': data.get('direction'),
-                            'encoding': data.get('encoding', 'L16'),
-                            'sample_rate': data.get('sample_rate'),
-                            'channels': data.get('channels', 1),
-                            'ptime': data.get('ptime'),
-                            'bytes_per_frame': data.get('bytes_per_frame'),
-                            'channel_codec': data.get('channel_codec'),
-                        }
-                        sessions[client_id] = session_info
-
-                        logger.info(f"[{client_id}] ═══════════════════════════════════════")
-                        logger.info(f"[{client_id}] Session initialized:")
-                        logger.info(f"[{client_id}]   UUID:           {session_info['uuid']}")
-                        logger.info(f"[{client_id}]   Direction:      {session_info['direction']}")
-                        logger.info(f"[{client_id}]   Encoding:       {session_info['encoding']}")
-                        logger.info(f"[{client_id}]   Sample Rate:    {session_info['sample_rate']} Hz")
-                        logger.info(f"[{client_id}]   Channels:       {session_info['channels']}")
-                        logger.info(f"[{client_id}]   Ptime:          {session_info['ptime']} ms")
-                        logger.info(f"[{client_id}]   Bytes/Frame:    {session_info['bytes_per_frame']}")
-                        logger.info(f"[{client_id}]   Channel Codec:  {session_info['channel_codec']}")
-                        logger.info(f"[{client_id}] ═══════════════════════════════════════")
-
-                        # Send acknowledgment back
-                        ack = json.dumps({
-                            'type': 'init_ack',
-                            'status': 'ok',
-                            'uuid': session_info['uuid']
-                        })
-                        await websocket.send(ack)
-                        logger.info(f"[{client_id}] Sent init acknowledgment")
+                    d = json.loads(message)
                 except json.JSONDecodeError:
-                    logger.warning(f"[{client_id}] Received non-JSON text message: {message}")
-
+                    logger.warning("[%s] non-JSON text ignored", client)
+                    continue
+                if d.get("event") == "start":
+                    started = True
+                    mf = d.get("media_format", {})
+                    cap = d.get("capture", {})
+                    logger.info("[%s] START call_id=%s rate=%s ch=%s mode=%s",
+                                client, d.get("call_id"), mf.get("sample_rate"),
+                                mf.get("channels"), cap.get("mode"))
+                    sink = WavSink(d.get("call_id", "call"),
+                                   int(mf.get("sample_rate") or 8000),
+                                   int(mf.get("channels") or 1),
+                                   cap.get("mode"),
+                                   cap.get("tracks"))
     except websockets.exceptions.ConnectionClosed as e:
-        logger.info(f"[{client_id}] Connection closed: {e}")
-    except Exception as e:
-        logger.error(f"[{client_id}] Error: {e}", exc_info=True)
+        logger.info("[%s] closed: %s", client, e)
     finally:
-        if client_id in sessions:
-            logger.info(f"[{client_id}] Session UUID: {sessions[client_id]['uuid']}")
-            del sessions[client_id]
-        logger.info(f"[{client_id}] Connection ended")
-        logger.info(f"[{client_id}] Session stats: "
-                  f"RX: {stats['frames_received']} frames ({stats['bytes_received']} bytes), "
-                  f"TX: {stats['frames_sent']} frames ({stats['bytes_sent']} bytes)")
+        if sink:
+            sink.close()
+        logger.info("[%s] ended. RX %d frames (%d bytes)", client, frames, total_bytes)
 
 
 async def main():
-    """Start the WebSocket server"""
-    host = '0.0.0.0'
-    port = 8080
-
-    logger.info(f"Starting WebSocket server on {host}:{port}")
-    logger.info("Press Ctrl+C to stop")
-
+    host, port = "0.0.0.0", 8080
+    logger.info("WebSocket tap test server on %s:%d  (recordings -> %s)", host, port, REC_DIR)
+    logger.info("Ctrl+C to stop")
     async with websockets.serve(handle_client, host, port):
-        await asyncio.Future()  # Run forever
+        await asyncio.Future()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Server stopped by user")
-        logger.info(f"Final stats: "
-                  f"Connections: {stats['connections']}, "
-                  f"RX: {stats['frames_received']} frames ({stats['bytes_received']} bytes), "
-                  f"TX: {stats['frames_sent']} frames ({stats['bytes_sent']} bytes)")
+        logger.info("stopped")

@@ -20,3 +20,6 @@ Makefile.in
 # Python test server
 __pycache__/
 *.pyc
+
+# test recordings (local only)
+test/recordings/
