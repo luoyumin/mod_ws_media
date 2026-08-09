@@ -99,6 +99,24 @@ fs_cli -x "load mod_ws_media"        # or: reload mod_ws_media
 fs_cli -x "module_exists mod_ws_media"   # -> true
 ```
 
+## Try it locally
+
+A zero-dependency example server lives in [`example/echo_server.py`](example/echo_server.py)
+(pure stdlib — no `pip install`). It accepts the tap, prints the `start` frame,
+and writes the streamed audio to a playable WAV:
+
+```bash
+python3 example/echo_server.py            # listens on ws://0.0.0.0:8080/
+```
+
+Then point a live call at it (needs a real media path — see Requirements):
+
+```bash
+uuid_ws_media <uuid> start ws://127.0.0.1:8080/media in=stereo role=agent
+# ...talk, then hang up...
+# -> ws_media_recordings/<call_id>_<port>.wav  (stereo: left=self, right=peer)
+```
+
 ## Usage
 
 ### Dialplan app
