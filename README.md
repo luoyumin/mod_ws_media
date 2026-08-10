@@ -1,5 +1,7 @@
 # mod_ws_media
 
+[![CI](https://github.com/luoyumin/mod_ws_media/actions/workflows/ci.yml/badge.svg)](https://github.com/luoyumin/mod_ws_media/actions/workflows/ci.yml)
+
 A FreeSWITCH module that **taps a call leg's audio and streams it to an external
 service over a WebSocket** in real time. The audio is decoded **L16 PCM**, so the
 server never deals with the RTP codec. Built for real-time ASR / transcription,
