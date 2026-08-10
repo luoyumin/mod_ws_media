@@ -93,18 +93,33 @@ def handle(conn, addr):
         return
     rate, channels, call_id = 8000, 1, "call"
     pcm = bytearray()
+    saw_stop = False       # got the {"event":"stop"} frame
+    clean_close = False    # got a Close frame rather than a bare EOF
     try:
         while True:
             opcode, payload = read_frame(conn)
-            if opcode is None or opcode == 0x8:      # EOF or Close
+            if opcode is None:                       # EOF without a Close frame
+                break
+            if opcode == 0x8:                        # Close -> echo it back
+                code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else 1005
+                reason = payload[2:].decode("utf-8", "replace")
+                print("[close] call_id=%s code=%d%s"
+                      % (call_id, code, (" reason=%s" % reason) if reason else ""))
+                conn.sendall(b"\x88" + bytes([len(payload)]) + payload)
+                clean_close = True
                 break
             if opcode == 0x9:                        # Ping -> Pong (unmasked)
                 conn.sendall(b"\x8a" + bytes([len(payload)]) + payload)
                 continue
-            if opcode == 0x1:                        # Text = the JSON start frame
+            if opcode == 0x1:                        # Text = a JSON control frame
                 try:
                     d = json.loads(payload.decode("utf-8"))
                 except ValueError:
+                    continue
+                if d.get("event") == "stop":
+                    saw_stop = True
+                    print("[stop]  call_id=%s reason=%s"
+                          % (d.get("call_id") or call_id, d.get("reason")))
                     continue
                 if d.get("event") == "start":
                     mf = d.get("media_format", {})
@@ -130,8 +145,11 @@ def handle(conn, addr):
                 w.setframerate(rate)
                 w.writeframes(bytes(pcm))
             secs = len(pcm) / (2 * channels * rate) if rate else 0
-            print("[stop]  call_id=%s wrote %s (%d bytes, %.1fs)"
-                  % (call_id, path, len(pcm), secs))
+            # A stream that ends without stop+Close was cut off, not finished —
+            # anything you accumulated for this call_id is incomplete.
+            state = "complete" if (saw_stop and clean_close) else "INCOMPLETE (no stop/close)"
+            print("[wav]   call_id=%s wrote %s (%d bytes, %.1fs) — %s"
+                  % (call_id, path, len(pcm), secs, state))
 
 
 def main():

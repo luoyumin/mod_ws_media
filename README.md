@@ -182,6 +182,20 @@ PCM. (Full/target protocol incl. injection is specified in
 }
 ```
 
+On teardown the module sends a matching `stop` frame and then a WebSocket
+**Close** frame with status `1000`:
+
+```json
+{ "event": "stop", "version": "1", "call_id": "abc123", "leg_uuid": "…", "reason": "call_ended" }
+```
+
+Treat these two as the only "the call really ended" signal: a connection that
+drops without them (status `1006`) means FreeSWITCH died or the network broke, so
+whatever you were accumulating for that `call_id` is **incomplete**. A server may
+also close first — send a Close frame and the module will echo it, stop sending,
+and stay off that backend for `bypass-recovery-interval` seconds, which is how
+you drain a backend for redeployment.
+
 Binary frames: raw signed 16-bit little-endian PCM.
 - `sample_rate` = the channel's native rate (e.g. G.722 → 16000, Opus → 48000).
 - channels: `read`/`write`/`mixed` = 1; `stereo` = 2 (interleaved `[L R L R …]`,
