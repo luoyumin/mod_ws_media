@@ -687,14 +687,23 @@ static switch_status_t ws_send_start(ws_session_t *s)
 static switch_status_t ws_send_stop(ws_session_t *s, const char *reason)
 {
 	char pkt[512];
+	int n;
 
 	if (!s || s->sock < 0 || !s->connected) return SWITCH_STATUS_FALSE;
 
-	snprintf(pkt, sizeof(pkt),
+	n = snprintf(pkt, sizeof(pkt),
 		"{\"event\":\"stop\",\"version\":\"1\",\"call_id\":\"%s\",\"leg_uuid\":\"%s\",\"reason\":\"%s\"}",
 		s->call_id ? s->call_id : s->uuid, s->uuid, reason ? reason : "call_ended");
 
-	return ws_send_frame_opcode(s, pkt, strlen(pkt), 0x1);
+	/* Truncated JSON is worse than no frame at all — the peer would just log a
+	 * parse error. Only an absurdly long call_id can get here. */
+	if (n < 0 || (size_t)n >= sizeof(pkt)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: stop frame too long, not sent on %s\n", s->uuid);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	return ws_send_frame_opcode(s, pkt, (size_t)n, 0x1);
 }
 
 static switch_status_t ws_connect(ws_session_t *s)
@@ -716,9 +725,23 @@ static switch_status_t ws_connect(ws_session_t *s)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* Teardown writes — the stop/Close frames and the TLS close_notify — are
+ * best-effort. The media path's SO_SNDTIMEO is reconnect-interval seconds (5 by
+ * default); cap the farewell well below that, so a peer that has stopped reading
+ * cannot stall FreeSWITCH's channel teardown. */
+static void ws_set_farewell_timeout(int sock)
+{
+	struct timeval tv;
+	if (sock < 0) return;
+	tv.tv_sec = 0;
+	tv.tv_usec = 500000;
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 static void ws_disconnect(ws_session_t *s)
 {
 	s->connected = 0;
+	ws_set_farewell_timeout(s->sock);
 	/* close_notify has to go out before the socket is torn down, otherwise
 	 * SSL_shutdown() is a silent no-op and the peer's TLS stack reports an
 	 * unexpected EOF. (In the graceful path ws_cleanup() has already shut the
@@ -923,11 +946,16 @@ static void ws_cleanup(ws_session_t *s)
 	 * abnormal 1006 closure on every normal hangup.
 	 * The send thread is deliberately not joined first: ->close_sent (set under
 	 * the send lock) already stops it from emitting anything after the Close, and
-	 * joining here would expose this path to a 5s SO_SNDTIMEO on a wedged peer.
+	 * joining here would expose channel teardown to the media SO_SNDTIMEO
+	 * (reconnect-interval seconds) on a wedged peer.
 	 * If the peer closed on us, ->close_sent is already set and both calls below
 	 * turn into no-ops, which is what RFC 6455 5.5.1 asks for. */
-	ws_send_stop(s, "call_ended");
-	ws_send_close(s, WS_CLOSE_NORMAL, "call_ended");
+	ws_set_farewell_timeout(s->sock);
+	/* If the stop frame cannot get out then the socket is already gone, and
+	 * attempting the Close frame as well would only burn a second timeout. */
+	if (ws_send_stop(s, "call_ended") == SWITCH_STATUS_SUCCESS) {
+		ws_send_close(s, WS_CLOSE_NORMAL, "call_ended");
+	}
 
 	ws_signal_disconnect(s);
 	if (s->send_thread) { switch_thread_join(&retval, s->send_thread); s->send_thread = NULL; }
