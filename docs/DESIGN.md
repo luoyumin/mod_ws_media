@@ -1,11 +1,14 @@
 # mod_ws_media — Routable Media Bus (Design & Protocol v1)
 
-> **Status: PROPOSAL / not yet implemented.**
-> This document describes the intended, general-purpose ("commercial-grade")
-> shape of the module. The *as-built* wire format of the current code is in
-> [`PROTOCOL.md`](PROTOCOL.md) (call it v0). This file (v1) is the target we
-> design toward; it is written to be reviewed and iterated **before** touching
-> code.
+> **Status: partly implemented.**
+> This document describes the intended, general-purpose shape of the module.
+> As of **v1.1.0** the *tap* half of it ships: one WebSocket per leg, per-call
+> configuration, `in=read|write|mixed|stereo` capture, the `start`/`stop`
+> control frames, a graceful Close, reconnect and recoverable bypass.
+> Injection (`out=`, `mode=sink|duplex`), resampling, `pause`/`resume`,
+> `mark`/`clear`/`kill` and the multiplexing ideas below are **design only** —
+> §15 states exactly which is which. (An earlier note described the pre-rewrite
+> v0 wire format; it was removed when v1 landed and remains in the git history.)
 
 ---
 
@@ -197,8 +200,22 @@ not base64-in-JSON — to keep it efficient.
 
 ### 7.5 `stop` + close
 
-On teardown the module sends `{"event":"stop","call_id":…,"reason":…}` and then
-a proper WebSocket **Close** frame before shutting the socket.
+On teardown the module sends
+
+```json
+{ "event": "stop", "version": "1", "call_id": "…", "leg_uuid": "…", "reason": "call_ended" }
+```
+
+and then a WebSocket **Close** frame with status `1000`, before shutting the
+socket down. Together those two are the *only* signal that a stream ended
+normally: a connection that drops without them is an abnormal closure (`1006`),
+meaning FreeSWITCH died or the network broke — so whatever the service had
+accumulated for that `call_id` is **incomplete**.
+
+The service may also close first. Send a Close frame and the module echoes it
+(RFC 6455 5.5.1), stops sending, and stays off that backend for
+`bypass-recovery-interval` seconds rather than reconnecting, which is how a
+backend is drained for redeployment.
 
 ## 8. Routing recipes
 
@@ -257,6 +274,9 @@ service's / dialplan's** job:
   enters *bypass* (audio flows natively, module stops streaming). Bypass is
   **recoverable**: after `bypass-recovery-interval` the module retries the
   backend.
+- **Drain:** a Close frame from the service puts the leg into bypass as well, so
+  a backend can be taken out of rotation without triggering a reconnect storm
+  (§7.5).
 - **Resume (future):** on reconnect, report the last sequence number so a
   service can resume cleanly.
 
@@ -298,30 +318,38 @@ Or via channel variables before `ws_media_start` (dialplan-friendly):
   reconnects, bypass state.
 - Counters are updated with atomics so readings are consistent across threads.
 
-## 15. Relationship to the current implementation & migration
+## 15. Implementation status
 
-The current code (v0, see `PROTOCOL.md`) already has: a hand-rolled RFC 6455
-client, per-direction connections, an `init` frame, binary L16, serial (replace)
-and parallel (copy) modes, drop policy, reconnect, recoverable bypass, atomic
-stats, TLS (method/SNI/optional verify), and CLOSE-time cleanup.
+Shipped as of **v1.1.0** — the `tap` half of this design:
 
-To reach v1, in rough dependency order:
+- one WebSocket per leg, established off the call-setup path;
+- per-call configuration from the command and channel variables, snapshotted
+  into the session at attach, so a `reload` cannot pull config out from under a
+  live call;
+- `in=read|write|mixed|stereo` capture at the channel's native rate, binary L16;
+- `start` and `stop` control frames, a graceful Close, and echoing a
+  service-initiated Close (§7.5);
+- role/label metadata declared in `start` (§6);
+- bounded buffers with drop-oldest, reconnect up to `max-retry-count`,
+  recoverable bypass, drain on a service Close (§11);
+- TLS with SNI and optional certificate verification, HTTP Basic auth;
+- ESL CUSTOM events and atomic counters (§14).
 
-1. **Per-call config** — accept URL/mode/`in`/`out`/rate/metadata from the
-   command and channel vars (biggest gap today; config is global-only).
-2. **Decouple capture from inject** — replace the fixed "capture-A/inject-A"
-   coupling with independent `in` (read|write|mixed|stereo) and `out`
-   (read|write), plus `tap`/`sink`/`duplex` modes.
-3. **`start`/`stop` control frames + graceful Close** — supersede the bare
-   `init` packet; emit a Close frame on teardown.
-4. **Resampling** — capture-to-rate and inject-to-target-rate.
-5. **Role/label metadata** in `start` (declare-don't-guess).
-6. **Auth/security extensions** — Bearer, custom headers, mTLS.
-7. **Nice-to-haves** — `pause`/`resume`, `mark`, `stats` API, optional binary
-   media header, reconnect-resume.
+Not implemented, in rough dependency order:
 
-Backward compatibility: v1 can keep a "raw/legacy" mode equivalent to v0 for
-existing servers, selected by config.
+1. **Injection** — `out=read|write` and the `sink` / `duplex` modes, i.e. all of
+   §7.4 except `stop`. Only needed once audio has to go *back* into the call
+   (live translation, whisper, prompts), so it is not on the critical path for
+   transcription or agent assist.
+2. **Resampling** — deliberately deferred (§9): the module sends the native rate
+   and the service resamples.
+3. **`pause` / `resume`, `mark`, a `stats` API.**
+4. **Auth extensions** — Bearer tokens, custom headers, mTLS (§13); only Basic
+   is wired up today.
+5. **Multiplexing, gRPC, codec passthrough** — §16.
+
+There is no v0 compatibility mode: v1 was a clean rewrite and the pre-rewrite
+wire format has no remaining users.
 
 ## 16. Open questions / roadmap
 
@@ -330,10 +358,11 @@ existing servers, selected by config.
   connection count at high scale but adds head-of-line-blocking risk and a
   demux/routing protocol; only pursue if connection count is proven to hurt.
 - **gRPC transport** as an additive backend.
-- **Per-session config snapshot** (also closes the reload-safety gap): capture
-  all config into the session at attach so worker threads never read globals.
 - **Codec passthrough** (send encoded RTP payload instead of L16) for bandwidth
   — niche; L16 is the ASR-friendly default.
-- **Send-only stereo variant** using `SMBF_READ_STREAM|SMBF_WRITE_STREAM|
-  SMBF_STEREO` + `switch_core_media_bug_read` (FS synchronizes the two
-  directions for you) — the natural implementation of `in=stereo, mode=tap`.
+
+Two items that used to sit here are done: the per-session config snapshot (which
+also closed the reload-safety gap), and the send-only stereo capture built on
+`SMBF_READ_STREAM|SMBF_WRITE_STREAM|SMBF_STEREO` +
+`switch_core_media_bug_read()`, which is how `in=stereo, mode=tap` is
+implemented.
