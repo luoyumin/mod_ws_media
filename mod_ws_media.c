@@ -127,6 +127,7 @@ typedef struct {
 	SSL_CTX *ssl_ctx;
 	SSL *ssl;
 	int connected;             /* 1 once the start frame is sent (ready to stream) */
+	int close_sent;            /* a Close frame has gone out on this connection */
 	int retry_count;
 	switch_mutex_t *send_lock; /* serialize socket writes (audio vs pong/start) */
 
@@ -494,6 +495,14 @@ static switch_status_t ws_send_frame_opcode(ws_session_t *s, const char *data, s
 	}
 
 	if (s->send_lock) switch_mutex_lock(s->send_lock);
+	/* RFC 6455 5.5.1: nothing may follow a Close frame. Checking and setting the
+	 * flag inside the lock is what makes that ordering airtight — a data frame
+	 * already holding the lock finishes first, and any later one is refused. */
+	if (s->close_sent && opcode < 0x8) {
+		if (s->send_lock) switch_mutex_unlock(s->send_lock);
+		return SWITCH_STATUS_FALSE;
+	}
+	if (opcode == 0x8) s->close_sent = 1;
 	if (send_exact(s->sock, s->ssl, frame, header_len) < 0) {
 		if (s->send_lock) switch_mutex_unlock(s->send_lock);
 		return SWITCH_STATUS_FALSE;
@@ -514,9 +523,41 @@ static switch_status_t ws_send_frame_opcode(ws_session_t *s, const char *data, s
 	return SWITCH_STATUS_SUCCESS;
 }
 
-/* Read one control/text/binary frame; auto-reply to ping. Binary payloads are
- * ignored in v1 (tap-only, server has nothing to send us). Returns TIMEOUT on
- * idle, FALSE on close/error. */
+/* Normal closure (RFC 6455 7.4.1). */
+#define WS_CLOSE_NORMAL 1000
+
+/* Send a Close frame, at most once per connection.
+ *
+ * Without this the peer only ever sees the TCP connection vanish, which RFC 6455
+ * calls an abnormal closure (status 1006). Since the module sends no
+ * application-level "end of stream" message either, the server would have no way
+ * to tell a finished call from a crashed FreeSWITCH or a severed network — an ASR
+ * backend would happily finalize a truncated transcript as if it were complete. */
+static switch_status_t ws_send_close(ws_session_t *s, uint16_t code, const char *reason)
+{
+	char payload[125];
+	size_t len = 2;
+
+	if (!s || s->sock < 0 || !s->connected) return SWITCH_STATUS_FALSE;
+	if (s->close_sent) return SWITCH_STATUS_SUCCESS;
+
+	payload[0] = (char)((code >> 8) & 0xFF);
+	payload[1] = (char)(code & 0xFF);
+	if (!zstr(reason)) {
+		size_t rlen = strlen(reason);
+		if (rlen > sizeof(payload) - 2) rlen = sizeof(payload) - 2;
+		memcpy(payload + 2, reason, rlen);
+		len += rlen;
+	}
+
+	/* ws_send_frame_opcode() sets ->close_sent under the send lock. */
+	return ws_send_frame_opcode(s, payload, len, 0x8);
+}
+
+/* Read one control/text/binary frame; auto-reply to ping, echo and report a
+ * peer-initiated Close. Binary payloads are ignored in v1 (tap-only, server has
+ * nothing to send us). Returns TIMEOUT on idle, BREAK when the peer closed
+ * cleanly, FALSE on error. */
 static switch_status_t ws_recv_control(ws_session_t *s)
 {
 	unsigned char header[14];
@@ -534,7 +575,6 @@ static switch_status_t ws_recv_control(ws_session_t *s)
 	opcode = header[0] & 0x0F;
 	if (header[0] & 0x70) return SWITCH_STATUS_FALSE;      /* reserved bits */
 	if (!(header[0] & 0x80)) return SWITCH_STATUS_FALSE;   /* no fragmentation */
-	if (opcode == 0x8) return SWITCH_STATUS_FALSE;         /* close */
 
 	plen = header[1] & 0x7F;
 	if (plen == 126) {
@@ -557,6 +597,26 @@ static switch_status_t ws_recv_control(ws_session_t *s)
 		if (recv_exact(s->sock, s->ssl, payload, (int)plen) != (int)plen) { free(payload); return SWITCH_STATUS_FALSE; }
 		payload[plen] = '\0';
 		if (header[1] & 0x80) { int i; for (i = 0; i < (int)plen; i++) payload[i] ^= header[header_len + (i % 4)]; }
+	}
+
+	if (opcode == 0x8) {  /* close -> echo a close back (RFC 6455 5.5.1) */
+		uint16_t peer_code = (plen >= 2)
+			? (uint16_t)((((unsigned char)payload[0]) << 8) | ((unsigned char)payload[1]))
+			: 0;
+		uint16_t echo = peer_code;
+
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+			"ws_media: peer closed the stream (code %u%s%s) on %s\n",
+			peer_code ? peer_code : 1005,
+			(plen > 2) ? ", reason: " : "", (plen > 2) ? payload + 2 : "", s->uuid);
+
+		/* 1004/1005/1006/1015 must never appear on the wire, and neither may
+		 * anything below 1000, so fall back to a plain normal closure. */
+		if (echo < 1000 || echo == 1004 || echo == 1005 || echo == 1006 || echo == 1015) echo = WS_CLOSE_NORMAL;
+		ws_send_close(s, echo, NULL);
+
+		switch_safe_free(payload);
+		return SWITCH_STATUS_BREAK;
 	}
 
 	if (opcode == 0x9) {  /* ping -> pong */
@@ -621,8 +681,34 @@ static switch_status_t ws_send_start(ws_session_t *s)
 	return ws_send_frame_opcode(s, pkt, strlen(pkt), 0x1);
 }
 
+/* Counterpart to the start frame (docs/DESIGN.md 7.5). Carries call_id/leg_uuid
+ * so a server multiplexing several streams knows which one just ended, and a
+ * reason so it can tell a finished call from a backend it dropped itself. */
+static switch_status_t ws_send_stop(ws_session_t *s, const char *reason)
+{
+	char pkt[512];
+	int n;
+
+	if (!s || s->sock < 0 || !s->connected) return SWITCH_STATUS_FALSE;
+
+	n = snprintf(pkt, sizeof(pkt),
+		"{\"event\":\"stop\",\"version\":\"1\",\"call_id\":\"%s\",\"leg_uuid\":\"%s\",\"reason\":\"%s\"}",
+		s->call_id ? s->call_id : s->uuid, s->uuid, reason ? reason : "call_ended");
+
+	/* Truncated JSON is worse than no frame at all — the peer would just log a
+	 * parse error. Only an absurdly long call_id can get here. */
+	if (n < 0 || (size_t)n >= sizeof(pkt)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: stop frame too long, not sent on %s\n", s->uuid);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	return ws_send_frame_opcode(s, pkt, (size_t)n, 0x1);
+}
+
 static switch_status_t ws_connect(ws_session_t *s)
 {
+	s->close_sent = 0;   /* fresh connection: nothing closed yet (matters after a bypass recovery) */
 	if (ws_open_socket(s) != SWITCH_STATUS_SUCCESS) return SWITCH_STATUS_FALSE;
 	if (s->cfg.ssl) {
 		if (ws_tls_establish(s) != SWITCH_STATUS_SUCCESS) { close(s->sock); s->sock = -1; return SWITCH_STATUS_FALSE; }
@@ -639,13 +725,31 @@ static switch_status_t ws_connect(ws_session_t *s)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* Teardown writes — the stop/Close frames and the TLS close_notify — are
+ * best-effort. The media path's SO_SNDTIMEO is reconnect-interval seconds (5 by
+ * default); cap the farewell well below that, so a peer that has stopped reading
+ * cannot stall FreeSWITCH's channel teardown. */
+static void ws_set_farewell_timeout(int sock)
+{
+	struct timeval tv;
+	if (sock < 0) return;
+	tv.tv_sec = 0;
+	tv.tv_usec = 500000;
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 static void ws_disconnect(ws_session_t *s)
 {
 	s->connected = 0;
-	if (s->sock >= 0) shutdown(s->sock, SHUT_RDWR);
+	ws_set_farewell_timeout(s->sock);
+	/* close_notify has to go out before the socket is torn down, otherwise
+	 * SSL_shutdown() is a silent no-op and the peer's TLS stack reports an
+	 * unexpected EOF. (In the graceful path ws_cleanup() has already shut the
+	 * socket down to wake the recv thread, so this only helps the paths where
+	 * it hasn't — see the note in ws_cleanup.) */
 	if (s->ssl) { SSL_shutdown(s->ssl); SSL_free(s->ssl); s->ssl = NULL; }
 	if (s->ssl_ctx) { SSL_CTX_free(s->ssl_ctx); s->ssl_ctx = NULL; }
-	if (s->sock >= 0) { close(s->sock); s->sock = -1; }
+	if (s->sock >= 0) { shutdown(s->sock, SHUT_RDWR); close(s->sock); s->sock = -1; }
 	ws_fire_event(WS_MEDIA_EVENT_DISCONNECTED, s, NULL, NULL);
 }
 
@@ -721,6 +825,17 @@ static void *SWITCH_THREAD_FUNC recv_thread(switch_thread_t *thread, void *obj)
 
 		st = ws_recv_control(s);
 		if (st == SWITCH_STATUS_TIMEOUT) continue;
+		if (st == SWITCH_STATUS_BREAK) {
+			/* The peer asked us to go away (drain, redeploy, quota). Honour it:
+			 * reconnecting straight away would turn a graceful drain into a
+			 * flap. bypass-recovery-interval decides if and when we come back
+			 * (0 = stay in bypass for the rest of the call). */
+			if (!s->running) break;
+			ws_disconnect(s);
+			s->bypass_mode = SWITCH_TRUE;
+			s->bypass_since = switch_micro_time_now();
+			continue;
+		}
 		if (st != SWITCH_STATUS_SUCCESS) {
 			if (!s->running) break;
 			ws_disconnect(s);   /* loop will reconnect */
@@ -824,8 +939,25 @@ static void ws_cleanup(ws_session_t *s)
 	s->cleaned_up = SWITCH_TRUE;
 	s->running = SWITCH_FALSE;
 
-	ws_signal_disconnect(s);
+	/* Say goodbye while the socket is still open: the stop frame first (it is a
+	 * data frame, so it has to precede the Close), then Close(1000). Both have to
+	 * happen before ws_signal_disconnect(), which shuts the socket down — doing
+	 * it the other way round is why the peer never saw either one and reported an
+	 * abnormal 1006 closure on every normal hangup.
+	 * The send thread is deliberately not joined first: ->close_sent (set under
+	 * the send lock) already stops it from emitting anything after the Close, and
+	 * joining here would expose channel teardown to the media SO_SNDTIMEO
+	 * (reconnect-interval seconds) on a wedged peer.
+	 * If the peer closed on us, ->close_sent is already set and both calls below
+	 * turn into no-ops, which is what RFC 6455 5.5.1 asks for. */
+	ws_set_farewell_timeout(s->sock);
+	/* If the stop frame cannot get out then the socket is already gone, and
+	 * attempting the Close frame as well would only burn a second timeout. */
+	if (ws_send_stop(s, "call_ended") == SWITCH_STATUS_SUCCESS) {
+		ws_send_close(s, WS_CLOSE_NORMAL, "call_ended");
+	}
 
+	ws_signal_disconnect(s);
 	if (s->send_thread) { switch_thread_join(&retval, s->send_thread); s->send_thread = NULL; }
 	if (s->recv_thread) { switch_thread_join(&retval, s->recv_thread); s->recv_thread = NULL; }
 
