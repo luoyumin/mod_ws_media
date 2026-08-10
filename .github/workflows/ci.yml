@@ -166,10 +166,14 @@ jobs:
         if: always()
         run: fs_cli -x 'fsctl shutdown asap' || true
 
-      - name: FreeSWITCH log
+      - name: FreeSWITCH logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: freeswitch-log
-          path: /tmp/fs.log
+          # fs.log is stdout, which stops once the boot step's shell exits;
+          # freeswitch.log is written by mod_logfile and covers the whole run.
+          path: |
+            /tmp/fs.log
+            /var/log/freeswitch/freeswitch.log
           if-no-files-found: warn

@@ -25,6 +25,11 @@
     <configuration name="modules.conf" description="Modules">
       <modules>
         <load module="mod_console"/>
+        <!-- mod_console loses stdout as soon as the CI step that started
+             FreeSWITCH exits ("We've become an orphan"), so anything after the
+             boot step would be missing from a redirected stdout log. Keep a
+             logfile the daemon owns instead. -->
+        <load module="mod_logfile"/>
         <load module="mod_commands"/>
         <load module="mod_dptools"/>
         <load module="mod_event_socket"/>
@@ -41,6 +46,20 @@
         <param name="colorize" value="false"/>
         <param name="loglevel" value="info"/>
       </settings>
+    </configuration>
+
+    <configuration name="logfile.conf" description="File Logging">
+      <profiles>
+        <profile name="default">
+          <settings>
+            <param name="logfile" value="/var/log/freeswitch/freeswitch.log"/>
+            <param name="rollover" value="0"/>
+          </settings>
+          <mappings>
+            <map name="all" value="console,debug,info,notice,warning,err,crit,alert"/>
+          </mappings>
+        </profile>
+      </profiles>
     </configuration>
 
     <configuration name="event_socket.conf" description="Socket Client">
