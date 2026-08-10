@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Linux, FreeSWITCH 1.10.x (Alpine ships freeswitch + freeswitch-dev in main,
+  # no authenticated repo / access token needed). Exercises the pkg-config
+  # discovery path and the `-shared` link branch of the Makefile.
+  # --------------------------------------------------------------------------
+  linux:
+    name: build · alpine ${{ matrix.alpine }}
+    runs-on: ubuntu-latest
+    container: alpine:${{ matrix.alpine }}
+    strategy:
+      fail-fast: false
+      matrix:
+        alpine: ['3.22', '3.21']
+    defaults:
+      run:
+        shell: sh   # Alpine has no bash; the default `bash -e {0}` would not exist
+
+    steps:
+      - name: Install toolchain + FreeSWITCH headers
+        run: apk add --no-cache build-base pkgconf git freeswitch-dev openssl-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Show discovered configuration
+        run: |
+          echo "FreeSWITCH: $(pkg-config --modversion freeswitch)"
+          echo "OpenSSL:    $(pkg-config --modversion openssl)"
+          make print-config
+
+      - name: Build
+        run: make
+
+      - name: Check the module exports its FreeSWITCH interface
+        run: |
+          test -f mod_ws_media.so
+          nm -D --defined-only mod_ws_media.so | grep -qw mod_ws_media_module_interface
+          nm -D --defined-only mod_ws_media.so | grep -qw mod_ws_media_load
+
+      - name: Staged install (no root paths touched)
+        run: |
+          make install DESTDIR="$PWD/stage"
+          find stage -type f | sort
+          test -f stage/usr/lib/freeswitch/mod/mod_ws_media.so
+          test -f stage/etc/freeswitch/autoload_configs/ws_media.conf.xml
+
+  # --------------------------------------------------------------------------
+  # macOS, FreeSWITCH 1.11.x from Homebrew. Three things only this job covers:
+  # the `-bundle -undefined dynamic_lookup` link branch, the FREESWITCH_PATH
+  # discovery branch (Linux above covers pkg-config), and the 1.11 (master)
+  # header line, which is where API drift shows up before it reaches a release.
+  # --------------------------------------------------------------------------
+  macos:
+    name: build · macos · FreeSWITCH 1.11 (brew)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FreeSWITCH + OpenSSL
+        run: brew install freeswitch openssl@3
+
+      - name: Point pkg-config at keg-only OpenSSL
+        run: echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Show discovered configuration
+        run: |
+          echo "brew prefix: $(brew --prefix freeswitch)"
+          echo "OpenSSL:     $(pkg-config --modversion openssl)"
+          # Informational only: whether brew happens to ship freeswitch.pc is
+          # not something this module depends on, since we build via
+          # FREESWITCH_PATH below.
+          pkg-config --modversion freeswitch || echo "(no freeswitch.pc from brew — expected, using FREESWITCH_PATH)"
+          make print-config FREESWITCH_PATH="$(brew --prefix freeswitch)"
+
+      - name: Build
+        run: make FREESWITCH_PATH="$(brew --prefix freeswitch)"
+
+      - name: Check the module exports its FreeSWITCH interface
+        run: |
+          test -f mod_ws_media.so
+          nm -gU mod_ws_media.so | grep -q mod_ws_media_module_interface
+          nm -gU mod_ws_media.so | grep -q mod_ws_media_load
+
+      - name: Staged install (no root paths touched)
+        run: |
+          make install DESTDIR="$PWD/stage" FREESWITCH_PATH="$(brew --prefix freeswitch)"
+          find stage -type f | sort
+
+  # --------------------------------------------------------------------------
+  # The check a compile cannot make: does the module actually dlopen() into a
+  # running FreeSWITCH, register its API/applications, and unload cleanly?
+  # Core-only boot (no sofia, no sound files) — see .github/ci/freeswitch.xml.
+  # --------------------------------------------------------------------------
+  smoke:
+    name: load into FreeSWITCH · alpine 3.22
+    runs-on: ubuntu-latest
+    container: alpine:3.22
+    defaults:
+      run:
+        shell: sh   # Alpine has no bash; the default `bash -e {0}` would not exist
+
+    steps:
+      - name: Install FreeSWITCH + toolchain
+        run: apk add --no-cache build-base pkgconf git freeswitch freeswitch-dev openssl-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Build and install
+        run: |
+          make
+          make install
+
+      - name: Install CI-only FreeSWITCH configuration
+        run: |
+          install -d /var/log/freeswitch /var/lib/freeswitch/db /var/run/freeswitch
+          install -m 0644 .github/ci/freeswitch.xml /etc/freeswitch/freeswitch.xml
+
+      - name: Boot FreeSWITCH
+        run: |
+          # No -nosql: `show api` / `show application` are answered out of the
+          # core SQL scoreboard, so disabling it would make those checks lie.
+          nohup freeswitch -nf -nonat > /tmp/fs.log 2>&1 &
+          for i in $(seq 1 45); do
+            fs_cli -x status >/dev/null 2>&1 && break
+            sleep 1
+          done
+          fs_cli -x status
+
+      - name: Module is loaded and its interfaces are registered
+        run: |
+          fs_cli -x 'module_exists mod_ws_media' | grep -q true
+          fs_cli -x 'show api'         | grep -qw uuid_ws_media
+          fs_cli -x 'show application' | grep -qw ws_media_start
+          fs_cli -x 'show application' | grep -qw ws_media_stop
+          # Same claim, without going through the SQL scoreboard: calling the
+          # API with no arguments must reach our own usage string.
+          fs_cli -x 'uuid_ws_media' | grep -q 'USAGE: uuid_ws_media'
+
+      - name: Unload / reload cycle (exercises the shutdown path)
+        run: |
+          fs_cli -x 'unload mod_ws_media'
+          sleep 2
+          fs_cli -x 'module_exists mod_ws_media' | grep -q false
+          fs_cli -x 'load mod_ws_media'
+          sleep 2
+          fs_cli -x 'module_exists mod_ws_media' | grep -q true
+
+      - name: Shut down
+        if: always()
+        run: fs_cli -x 'fsctl shutdown asap' || true
+
+      - name: FreeSWITCH logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeswitch-log
+          # fs.log is stdout, which stops once the boot step's shell exits;
+          # freeswitch.log is written by mod_logfile and covers the whole run.
+          path: |
+            /tmp/fs.log
+            /var/log/freeswitch/freeswitch.log
+          if-no-files-found: warn
