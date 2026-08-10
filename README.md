@@ -10,10 +10,11 @@ recording, and audio analytics.
 Self-contained WebSocket client (RFC 6455) on top of OpenSSL — **no
 libwebsockets, no gRPC, no extra runtime dependencies** beyond OpenSSL.
 
-> **v1.0 — tap only.** This version captures/forks audio out; it is **completely
+> **v1.1 — tap only.** This version captures/forks audio out; it is **completely
 > non-intrusive** (read-only, never modifies or injects audio into the call).
 > Injection and cross-leg routing are on the roadmap (see
-> [`docs/DESIGN.md`](docs/DESIGN.md)). Validated on a live call.
+> [`docs/DESIGN.md`](docs/DESIGN.md), which states exactly what is implemented
+> and what is still design). Validated on live calls and under a soak test.
 
 ---
 
