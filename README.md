@@ -10,11 +10,17 @@ recording, and audio analytics.
 Self-contained WebSocket client (RFC 6455) on top of OpenSSL — **no
 libwebsockets, no gRPC, no extra runtime dependencies** beyond OpenSSL.
 
-> **v1.1 — tap only.** This version captures/forks audio out; it is **completely
+> **v1.2 — tap only.** This version captures/forks audio out; it is **completely
 > non-intrusive** (read-only, never modifies or injects audio into the call).
 > Injection and cross-leg routing are on the roadmap (see
 > [`docs/DESIGN.md`](docs/DESIGN.md), which states exactly what is implemented
 > and what is still design). Validated on live calls and under a soak test.
+
+> **Upgrading from v1.1.0 or earlier?** If you attach with `in=read` or
+> `in=write` (`in=read` is the default), those releases can leave the leg
+> unhangupable and stream fabricated filler audio. See
+> [`CHANGELOG.md`](CHANGELOG.md) for what was affected and why `in=stereo` /
+> `in=mixed` were not.
 
 ---
 
@@ -135,6 +141,21 @@ uuid_ws_media <uuid> start ws://127.0.0.1:8080/media in=stereo role=agent
 ```bash
 uuid_ws_media <uuid> start ws://127.0.0.1:8080/media in=stereo role=agent call_id=abc123
 uuid_ws_media <uuid> stop
+uuid_ws_media <uuid> stats
+```
+
+`stats` prints the live counters for that leg. `frames_dropped` is the one to
+watch: it only grows when the send buffer is already at `max-queue-size`, i.e.
+when the peer or the network cannot keep up with the capture.
+
+```
+state          : connected        # connected | reconnecting | bypass
+uptime_sec     : 42
+retry_count    : 0
+frames_sent    : 2100
+frames_dropped : 0
+bytes_sent     : 33600000
+queued_bytes   : 640 / 8192
 ```
 
 ### Channel variables (dialplan-friendly)
@@ -213,6 +234,11 @@ CUSTOM events, subclass prefix `ws_media::`:
 fs_cli> /events plain CUSTOM ws_media::start ws_media::stop ws_media::error
 ```
 
+Every event carries `Unique-ID`, `Call-ID`, and the counters `Frames-Sent`,
+`Frames-Dropped`, `Bytes-Sent` — so a consumer can reconcile a stream without
+polling: on `stop` they are the final tally, and on `disconnected` they say how
+much got through before the drop.
+
 ## Configuration (`autoload_configs/ws_media.conf.xml` — defaults only)
 
 | Param | Default | Meaning |
@@ -234,12 +260,13 @@ command / channel variables above and override these defaults.
 ## Roadmap
 
 - **v1.x — fork only** (this line): `v1.0` tap (read/write/mixed/stereo) ✅;
+  `v1.1` graceful teardown ✅; `v1.2` capture/teardown correctness + `stats` ✅;
   optional capture resampling (default native) — planned, low priority.
 - **v2.x — injection & routing**: inject the server's processed audio back into
   a chosen leg (same-leg, then cross-leg / cross-call). Enables real-time
   translation, prompts, agent whisper.
-- **v3.x**: pause/resume, stats API, framed media header, auth extensions
-  (Bearer/mTLS), multiplexing, optional gRPC transport.
+- **v3.x**: pause/resume, framed media header, auth extensions (Bearer/mTLS),
+  multiplexing, optional gRPC transport.
 
 Design and target protocol: [`docs/DESIGN.md`](docs/DESIGN.md).
 
