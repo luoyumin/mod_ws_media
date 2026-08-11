@@ -62,6 +62,7 @@ SWITCH_STANDARD_APP(ws_media_stop_app);
 /* Relaxed atomics for cross-thread counters. */
 #define WS_STAT_INC(x)    __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
 #define WS_STAT_ADD(x, n) __atomic_add_fetch(&(x), (uint64_t)(n), __ATOMIC_RELAXED)
+#define WS_STAT_GET(x)    __atomic_load_n(&(x), __ATOMIC_RELAXED)
 
 /* Capture source: which audio of the tapped leg to stream out. */
 typedef enum {
@@ -289,7 +290,7 @@ static switch_status_t ws_open_socket(ws_session_t *s)
 	hints.ai_protocol = IPPROTO_TCP;
 
 	if ((gai = getaddrinfo(s->cfg.host, port, &hints, &result)) != 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: resolve %s failed: %s\n", s->cfg.host, gai_strerror(gai));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "ws_media: resolve %s failed: %s\n", s->cfg.host, gai_strerror(gai));
 		return SWITCH_STATUS_FALSE;
 	}
 	for (rp = result; rp; rp = rp->ai_next) {
@@ -304,7 +305,7 @@ static switch_status_t ws_open_socket(ws_session_t *s)
 		close(sock);
 	}
 	freeaddrinfo(result);
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: connect %s:%d failed\n", s->cfg.host, s->cfg.port);
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "ws_media: connect %s:%d failed\n", s->cfg.host, s->cfg.port);
 	return SWITCH_STATUS_FALSE;
 }
 
@@ -408,7 +409,7 @@ static switch_status_t ws_handshake(ws_session_t *s)
 		if (!strstr(resp, "\r\n\r\n")) { free(key); return SWITCH_STATUS_FALSE; }
 	}
 	if (!ws_validate_handshake(resp, key)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: handshake rejected\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "ws_media: handshake rejected\n");
 		free(key);
 		return SWITCH_STATUS_FALSE;
 	}
@@ -441,17 +442,17 @@ static switch_status_t ws_tls_establish(ws_session_t *s)
 	SSL_set_fd(ssl, s->sock);
 	if (!host_is_ip_literal(s->cfg.host)) SSL_set_tlsext_host_name(ssl, s->cfg.host);
 	if (SSL_connect(ssl) != 1) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: TLS handshake failed\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "ws_media: TLS handshake failed\n");
 		SSL_free(ssl); SSL_CTX_free(ctx);
 		return SWITCH_STATUS_FALSE;
 	}
 	if (s->cfg.ssl_verify && SSL_get_verify_result(ssl) != X509_V_OK) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: TLS cert verify failed\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "ws_media: TLS cert verify failed\n");
 		SSL_free(ssl); SSL_CTX_free(ctx);
 		return SWITCH_STATUS_FALSE;
 	}
 	if (!s->cfg.ssl_verify) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: TLS cert NOT verified (ws-ssl-verify=false)\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_WARNING, "ws_media: TLS cert NOT verified (ws-ssl-verify=false)\n");
 	}
 	s->ssl_ctx = ctx;
 	s->ssl = ssl;
@@ -605,7 +606,7 @@ static switch_status_t ws_recv_control(ws_session_t *s)
 			: 0;
 		uint16_t echo = peer_code;
 
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_NOTICE,
 			"ws_media: peer closed the stream (code %u%s%s) on %s\n",
 			peer_code ? peer_code : 1005,
 			(plen > 2) ? ", reason: " : "", (plen > 2) ? payload + 2 : "", s->uuid);
@@ -698,7 +699,7 @@ static switch_status_t ws_send_stop(ws_session_t *s, const char *reason)
 	/* Truncated JSON is worse than no frame at all — the peer would just log a
 	 * parse error. Only an absurdly long call_id can get here. */
 	if (n < 0 || (size_t)n >= sizeof(pkt)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_WARNING,
 			"ws_media: stop frame too long, not sent on %s\n", s->uuid);
 		return SWITCH_STATUS_FALSE;
 	}
@@ -718,7 +719,7 @@ static switch_status_t ws_connect(ws_session_t *s)
 	/* Send the start frame BEFORE marking connected, so the send thread cannot
 	 * emit audio ahead of it (send thread gates on ->connected). */
 	if (ws_send_start(s) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: start frame not sent\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_WARNING, "ws_media: start frame not sent\n");
 	}
 	s->connected = 1;
 	ws_fire_event(WS_MEDIA_EVENT_CONNECTED, s, NULL, NULL);
@@ -771,6 +772,13 @@ static void ws_fire_event(const char *name, ws_session_t *s, const char *key, co
 	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", s->uuid);
 	if (s->call_id) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Call-ID", s->call_id);
 	if (key && val) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, key, val);
+	/* Counters ride along on every event so a consumer can reconcile a stream
+	 * without polling: on ws_media::stop they are the final tally, and on
+	 * ws_media::disconnected they say how much got through before the drop.
+	 * Frames-Dropped > 0 means the peer could not keep up with the capture. */
+	switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Frames-Sent", "%llu", (unsigned long long)WS_STAT_GET(s->frames_sent));
+	switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Frames-Dropped", "%llu", (unsigned long long)WS_STAT_GET(s->frames_dropped));
+	switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Bytes-Sent", "%llu", (unsigned long long)WS_STAT_GET(s->bytes_sent));
 	switch_event_fire(&event);
 }
 
@@ -785,7 +793,7 @@ static switch_bool_t ws_bypass_try_recover(ws_session_t *s)
 	if (s->cfg.bypass_recovery_sec <= 0) return SWITCH_FALSE;
 	now = switch_micro_time_now();
 	if (s->bypass_since == 0 || (now - s->bypass_since) < (switch_time_t)s->cfg.bypass_recovery_sec * 1000000) return SWITCH_FALSE;
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "ws_media: leaving bypass to retry backend\n");
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_NOTICE, "ws_media: leaving bypass to retry backend\n");
 	s->bypass_mode = SWITCH_FALSE;
 	s->bypass_since = 0;
 	s->retry_count = 0;
@@ -811,15 +819,33 @@ static void *SWITCH_THREAD_FUNC recv_thread(switch_thread_t *thread, void *obj)
 
 		if (!s->connected) {
 			if (s->retry_count >= s->cfg.max_retry_count) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: max retries, entering bypass\n");
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_WARNING, "ws_media: max retries, entering bypass\n");
 				s->bypass_mode = SWITCH_TRUE;
 				s->bypass_since = switch_micro_time_now();
 				ws_fire_event(WS_MEDIA_EVENT_ERROR, s, "Error", "max retries, bypass");
 				continue;
 			}
 			s->retry_count++;
-			switch_yield((switch_time_t)(s->cfg.reconnect_interval > 0 ? s->cfg.reconnect_interval : 5) * 1000000);
-			if (s->running && !s->bypass_mode && ws_connect(s) == SWITCH_STATUS_SUCCESS) s->retry_count = 0;
+			/* Back off in 100ms slices rather than one long switch_yield(): the sleep
+			 * cannot be woken, ws_cleanup() joins this thread on teardown, and
+			 * ws_signal_disconnect()'s shutdown() only interrupts a blocking recv() —
+			 * so a single multi-second sleep here stalls channel teardown for the
+			 * whole reconnect interval, precisely while the backend is down and every
+			 * call is cycling through this branch. */
+			{
+				/* load_config() already clamps reconnect-interval to 1..3600; this
+				 * second cap is local belt and braces, so the slice count cannot
+				 * overflow no matter what ends up in cfg (the single-sleep version
+				 * this replaced widened to switch_time_t before multiplying). */
+				int secs = s->cfg.reconnect_interval > 0 ? s->cfg.reconnect_interval : 5;
+				int slices = (secs > 3600 ? 3600 : secs) * 10;
+				while (slices-- > 0 && s->running && switch_channel_up(channel)) switch_yield(100000);
+			}
+			/* Re-check the channel before dialling: it may have hung up during the
+			 * backoff, and connecting for a dead leg hands the service a start frame
+			 * for a call that no longer exists. */
+			if (s->running && switch_channel_up(channel) && !s->bypass_mode &&
+				ws_connect(s) == SWITCH_STATUS_SUCCESS) s->retry_count = 0;
 			continue;
 		}
 
@@ -909,9 +935,18 @@ static switch_bool_t ws_capture_callback(switch_media_bug_t *bug, void *user_dat
 			switch_frame_t frame = { 0 };
 			frame.data = data;
 			frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-			while (switch_core_media_bug_read(bug, &frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS &&
-			       !switch_test_flag((&frame), SFF_CNG)) {
-				if (!frame.datalen) continue;
+			/* Exactly one frame per callback, the way switch_ivr_record() does it.
+			 * Draining in a loop looks harmless -- keep the bug's buffer clear --
+			 * but switch_core_media_bug_read() hands back overlapping data when
+			 * it is called repeatedly inside a single callback. Measured against
+			 * uuid_record running on the same leg at the same time: the loop
+			 * produced ~13x realtime audio and dropped 87% of it at
+			 * max-queue-size, while the recorder produced exactly 1x. The loop
+			 * was also what pinned the session thread (park -> read_frame -> here)
+			 * when the media path was not clock-paced, wedging the channel past
+			 * any hupall. */
+			if (switch_core_media_bug_read(bug, &frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS &&
+			    !switch_test_flag((&frame), SFF_CNG) && frame.datalen) {
 				switch_mutex_lock(s->audio_mutex);
 				if (switch_buffer_inuse(s->send_buffer) < (switch_size_t)s->cfg.max_queue_size) {
 					switch_buffer_write(s->send_buffer, frame.data, frame.datalen);
@@ -963,10 +998,24 @@ static void ws_cleanup(ws_session_t *s)
 
 	ws_disconnect(s);
 
+	/* Drop the channel's handle on the bug before the bug itself can go away.
+	 * On the hangup path nothing else clears it (only ws_media_stop() does), so
+	 * uuid_ws_media <uuid> stats could otherwise reach a removed bug. */
+	if (s->session) {
+		switch_channel_t *channel = switch_core_session_get_channel(s->session);
+		if (channel && switch_channel_get_private(channel, WS_PRIVATE_KEY)) {
+			switch_channel_set_private(channel, WS_PRIVATE_KEY, NULL);
+		}
+	}
+
+	/* Under audio_mutex: the stats command reads ->send_buffer under the same
+	 * lock, and destroying it from here unsynchronised is a use-after-free. */
+	if (s->audio_mutex) switch_mutex_lock(s->audio_mutex);
 	if (s->send_buffer) switch_buffer_destroy(&s->send_buffer);
+	if (s->audio_mutex) switch_mutex_unlock(s->audio_mutex);
 
 	ws_fire_event(WS_MEDIA_EVENT_STOP, s, NULL, NULL);
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ws_media: stopped on %s\n", s->uuid);
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_INFO, "ws_media: stopped on %s\n", s->uuid);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1085,16 +1134,16 @@ static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char 
 	switch_memory_pool_t *pool = switch_core_session_get_pool(fs);
 
 	if (switch_channel_get_private(channel, WS_PRIVATE_KEY)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_WARNING,
 			"ws_media: already running on %s (one tap per leg; stop it first)\n", switch_channel_get_name(channel));
 		return SWITCH_STATUS_INUSE;
 	}
 	if (!switch_channel_media_ready(channel)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: media not ready on %s\n", switch_channel_get_name(channel));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_ERROR, "ws_media: media not ready on %s\n", switch_channel_get_name(channel));
 		return SWITCH_STATUS_FALSE;
 	}
 	if (switch_channel_test_flag(channel, CF_PROXY_MEDIA) || switch_true(switch_channel_get_variable(channel, "bypass_media"))) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: proxy/bypass media, cannot attach on %s\n", switch_channel_get_name(channel));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_ERROR, "ws_media: proxy/bypass media, cannot attach on %s\n", switch_channel_get_name(channel));
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1106,7 +1155,7 @@ static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char 
 	s->running = SWITCH_TRUE;
 
 	if (switch_core_session_get_read_impl(fs, &s->read_impl) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: no read codec impl on %s\n", switch_channel_get_name(channel));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_ERROR, "ws_media: no read codec impl on %s\n", switch_channel_get_name(channel));
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1114,7 +1163,7 @@ static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char 
 	s->start_time = switch_micro_time_now();
 
 	if (switch_buffer_create_dynamic(&s->send_buffer, 1024, 8192, 0) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: buffer alloc failed\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_ERROR, "ws_media: buffer alloc failed\n");
 		return SWITCH_STATUS_FALSE;
 	}
 	switch_mutex_init(&s->audio_mutex, SWITCH_MUTEX_NESTED, pool);
@@ -1122,7 +1171,7 @@ static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char 
 
 	flags = capture_flags(s->capture);
 	if (switch_core_media_bug_add(fs, "ws_media", NULL, ws_capture_callback, s, 0, flags, &bug) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ws_media: media_bug_add failed on %s\n", switch_channel_get_name(channel));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_ERROR, "ws_media: media_bug_add failed on %s\n", switch_channel_get_name(channel));
 		switch_buffer_destroy(&s->send_buffer);
 		return SWITCH_STATUS_FALSE;
 	}
@@ -1137,7 +1186,7 @@ static switch_status_t ws_media_start(switch_core_session_t *fs, int argc, char 
 	switch_thread_create(&s->send_thread, thd_attr, send_thread, s, pool);
 
 	ws_fire_event(WS_MEDIA_EVENT_START, s, NULL, NULL);
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_INFO,
 		"ws_media: started on %s -> %s://%s:%d%s in=%s ch=%d\n",
 		switch_channel_get_name(channel), s->cfg.ssl ? "wss" : "ws",
 		s->cfg.host, s->cfg.port, s->cfg.path, cap_name(s->capture), s->channels);
@@ -1151,7 +1200,7 @@ static switch_status_t ws_media_stop(switch_core_session_t *fs)
 	switch_channel_t *channel = switch_core_session_get_channel(fs);
 	switch_media_bug_t *bug = switch_channel_get_private(channel, WS_PRIVATE_KEY);
 	if (!bug) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "ws_media: not running on %s\n", switch_channel_get_name(channel));
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(fs), SWITCH_LOG_WARNING, "ws_media: not running on %s\n", switch_channel_get_name(channel));
 		return SWITCH_STATUS_FALSE;
 	}
 	switch_channel_set_private(channel, WS_PRIVATE_KEY, NULL);
@@ -1174,13 +1223,64 @@ SWITCH_STANDARD_APP(ws_media_stop_app)
 	ws_media_stop(session);
 }
 
+/* Dump the live counters for this leg. Without this the only way to tell a
+ * healthy stream from one that is silently dropping audio is to instrument the
+ * receiving service: Frames-Dropped is incremented in the capture callback when
+ * the send buffer is already at max-queue-size, i.e. when the peer (or the
+ * network) cannot keep up, and nothing else in the module surfaces it.
+ * Returns SWITCH_STATUS_FALSE if no tap is running on this leg. */
+static switch_status_t ws_media_stats(switch_core_session_t *fs, switch_stream_handle_t *stream)
+{
+	switch_channel_t *channel = switch_core_session_get_channel(fs);
+	switch_media_bug_t *bug = switch_channel_get_private(channel, WS_PRIVATE_KEY);
+	ws_session_t *s;
+	switch_size_t queued = 0;
+	const char *state;
+
+	if (!bug || !(s = (ws_session_t *)switch_core_media_bug_get_user_data(bug))) return SWITCH_STATUS_FALSE;
+
+	if (s->audio_mutex) {
+		switch_mutex_lock(s->audio_mutex);
+		if (s->send_buffer) queued = switch_buffer_inuse(s->send_buffer);
+		switch_mutex_unlock(s->audio_mutex);
+	}
+	state = s->bypass_mode ? "bypass" : (s->connected ? "connected" : "reconnecting");
+
+	stream->write_function(stream,
+		"uuid           : %s\n"
+		"call_id        : %s\n"
+		"role           : %s\n"
+		"capture        : %s (%d ch)\n"
+		"peer           : %s://%s:%d%s\n"
+		"state          : %s\n"
+		"uptime_sec     : %lld\n"
+		"retry_count    : %d\n"
+		"frames_sent    : %llu\n"
+		"frames_dropped : %llu\n"
+		"bytes_sent     : %llu\n"
+		"queued_bytes   : %lu / %d\n",
+		s->uuid,
+		s->call_id ? s->call_id : "",
+		s->role ? s->role : "",
+		cap_name(s->capture), s->channels,
+		s->cfg.ssl ? "wss" : "ws", s->cfg.host, s->cfg.port, s->cfg.path,
+		state,
+		(long long)((switch_micro_time_now() - s->start_time) / 1000000),
+		s->retry_count,
+		(unsigned long long)WS_STAT_GET(s->frames_sent),
+		(unsigned long long)WS_STAT_GET(s->frames_dropped),
+		(unsigned long long)WS_STAT_GET(s->bytes_sent),
+		(unsigned long)queued, s->cfg.max_queue_size);
+	return SWITCH_STATUS_SUCCESS;
+}
+
 SWITCH_STANDARD_API(ws_media_api)
 {
 	char *mycmd = NULL, *argv[16] = {0};
 	int argc = 0;
 
 	if (!zstr(cmd) && (mycmd = strdup(cmd))) argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
-	if (argc < 2) { stream->write_function(stream, "-USAGE: uuid_ws_media <uuid> <start [ws-url] [in=..] [role=..] [call_id=..] | stop>\n"); goto done; }
+	if (argc < 2) { stream->write_function(stream, "-USAGE: uuid_ws_media <uuid> <start [ws-url] [in=..] [role=..] [call_id=..] | stop | stats>\n"); goto done; }
 
 	{
 		switch_core_session_t *fs = switch_core_session_locate(argv[0]);
@@ -1198,6 +1298,10 @@ SWITCH_STANDARD_API(ws_media_api)
 			if (ws_media_stop(fs) == SWITCH_STATUS_SUCCESS) {
 				stream->write_function(stream, "+OK\n");
 			} else {
+				stream->write_function(stream, "-ERR not running on this leg\n");
+			}
+		} else if (!strcasecmp(argv[1], "stats")) {
+			if (ws_media_stats(fs, stream) != SWITCH_STATUS_SUCCESS) {
 				stream->write_function(stream, "-ERR not running on this leg\n");
 			}
 		} else {
@@ -1261,6 +1365,39 @@ static switch_status_t load_config(switch_bool_t reload)
 		}
 		switch_xml_free(xml);
 	}
+
+	/* Everything above comes straight from atoi(), which turns anything
+	 * unparsable into 0 without complaint. Clamp here rather than at each use
+	 * site, and say so, otherwise a typo silently changes runtime behaviour. */
+	if (globals.port < 1 || globals.port > 65535) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: ws-port %d out of range, using 8080\n", globals.port);
+		globals.port = 8080;
+	}
+	if (globals.max_queue_size < 1024) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: max-queue-size %d too small, using 8192\n", globals.max_queue_size);
+		globals.max_queue_size = 8192;
+	}
+	/* drop-threshold is the size the send buffer is tossed back down to once it
+	 * exceeds max-queue-size. It MUST stay below max-queue-size: the send thread
+	 * computes (inuse - drop_threshold) in switch_size_t, so a threshold above
+	 * the trigger point underflows to a huge value and tosses the whole buffer. */
+	if (globals.drop_threshold < 1 || globals.drop_threshold >= globals.max_queue_size) {
+		int fixed = globals.max_queue_size / 2;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: drop-threshold %d must be in 1..%d, using %d\n",
+			globals.drop_threshold, globals.max_queue_size - 1, fixed);
+		globals.drop_threshold = fixed;
+	}
+	/* Also the socket SO_RCVTIMEO/SO_SNDTIMEO and the connect timeout, so a
+	 * silly value here means "effectively no timeout at all". */
+	if (globals.reconnect_interval < 1 || globals.reconnect_interval > 3600) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"ws_media: reconnect-interval %d out of range (1..3600), using 5\n", globals.reconnect_interval);
+		globals.reconnect_interval = 5;
+	}
+
 	globals.config_pool = pool;
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -1289,6 +1426,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_ws_media_load)
 	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=mixed");
 	switch_console_set_complete("add uuid_ws_media ::console::list_uuid start in=stereo");
 	switch_console_set_complete("add uuid_ws_media ::console::list_uuid stop");
+	switch_console_set_complete("add uuid_ws_media ::console::list_uuid stats");
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_ws_media (v1 tap) loaded\n");
 	return SWITCH_STATUS_SUCCESS;

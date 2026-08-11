@@ -268,8 +268,23 @@ service's / dialplan's** job:
 
 - **Backpressure:** bounded per-stream buffers with a drop-oldest policy that
   favors latency over completeness (`max-queue-size` / `drop-threshold`).
+  `drop-threshold` must stay below `max-queue-size` — the send thread computes
+  `inuse - drop-threshold` in `switch_size_t`, so a threshold above the trigger
+  point underflows and tosses the whole buffer; the config loader clamps it.
 - **Reconnect:** on failure, reconnect with the configured interval up to
-  `max-retry-count`; connections are established off the call-setup path.
+  `max-retry-count`; connections are established off the call-setup path. The
+  backoff waits in 100ms slices and re-checks the channel, because teardown
+  joins the reconnect thread: one long uninterruptible sleep there stalls
+  channel teardown for the whole interval, exactly while the backend is down
+  and every call is cycling through that branch.
+- **Known gap:** `ws_connect()` itself is not interruptible. `ws_open_socket()`
+  keeps the fd in a local until connect succeeds, so `s->sock` is still `-1`
+  and the `shutdown()` that wakes a blocked reader is a no-op for the whole
+  attempt. A hangup that lands mid-connect waits out DNS plus one connect
+  timeout per resolved address plus the handshake read timeouts. It is a delay,
+  not a wedge — the channel always completes teardown. Fixing it properly means
+  reworking socket ownership (publishing the fd early races `ws_disconnect()`
+  closing an fd another thread is still using, and fd numbers get reused).
 - **Bypass:** after exhausting retries (or on excessive drop rate) the leg
   enters *bypass* (audio flows natively, module stops streaming). Bypass is
   **recoverable**: after `bypass-recovery-interval` the module retries the
@@ -320,7 +335,7 @@ Or via channel variables before `ws_media_start` (dialplan-friendly):
 
 ## 15. Implementation status
 
-Shipped as of **v1.1.0** — the `tap` half of this design:
+Shipped as of **v1.2.0** — the `tap` half of this design:
 
 - one WebSocket per leg, established off the call-setup path;
 - per-call configuration from the command and channel variables, snapshotted
@@ -333,7 +348,19 @@ Shipped as of **v1.1.0** — the `tap` half of this design:
 - bounded buffers with drop-oldest, reconnect up to `max-retry-count`,
   recoverable bypass, drain on a service Close (§11);
 - TLS with SNI and optional certificate verification, HTTP Basic auth;
-- ESL CUSTOM events and atomic counters (§14).
+- ESL CUSTOM events and atomic counters (§14), `uuid_ws_media <uuid> stats`, and
+  the counters on every event.
+
+One capture rule is worth stating explicitly, because getting it wrong is not
+obvious: the media-bug callback reads **exactly one frame per invocation**, the
+way `switch_ivr_record()` does. Draining in a loop looks like a harmless
+optimisation, but `switch_core_media_bug_read()` only reports "nothing to give"
+when *both* the read and write buffers are dry — so on a single-direction tap
+(`in=read` or `in=write`, where only one `SMBF_*_STREAM` flag is set) that
+condition is unreachable, and it keeps returning success with synthesised
+`0xFF` filler frames. In a loop that means an endless stream of fabricated
+audio, on the leg's own session thread, which is also the only thread that can
+carry that leg through hangup.
 
 Not implemented, in rough dependency order:
 
